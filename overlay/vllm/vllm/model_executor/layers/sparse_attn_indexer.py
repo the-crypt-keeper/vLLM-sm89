@@ -651,6 +651,44 @@ def sparse_attn_indexer(
             1024,
             2048,
         )
+        # sm89 (Ada) correctness fix, 2026-08-01.
+        #
+        # The compiled radix selectors (cooperative_topk / persistent_topk) take
+        # a scan bound over the logits columns as their last argument, and the
+        # DSV4 call site hands them `common_attn_metadata.max_seq_len` -- the
+        # UNCOMPRESSED sequence length -- while `seq_lens` in the same call has
+        # already been divided by `compress_ratio` (see mla/indexer.py). For the
+        # compress_ratio=4 layers that bound is 4x too large, so columns past the
+        # valid compressed region are eligible for selection. It is harmless
+        # while the compressed candidate count stays <= index_topk (everything
+        # valid is taken anyway) and starts corrupting the selection the moment
+        # real ranking begins -- i.e. at compressed count 512, absolute context
+        # position 2048. Measured signature: a NaN logits row at position ~2053
+        # that makes the sampler emit BOS mid-stream and collapses the rest of
+        # the generation into token salad.
+        #
+        # `top_k_per_row_decode` takes no such bound (it can only clamp per row
+        # by the compressed `seq_lens`), so routing to it is correct by
+        # construction. All four independent implementations agree on the
+        # invariant that the candidate axis must be exactly the compressed count:
+        # DeepSeek's own inference/model.py:433
+        # (`topk(min(index_topk, end_pos // ratio))`), antirez/DS.cpp ds4.c:12886,
+        # llama.cpp deepseek4.cpp:613, and SGLang dsv4/indexer.py:296.
+        #
+        # The defective code is stock vLLM 0.25.1, but nothing upstream claims
+        # sm89 support here: the capability-90 gate is what drops us off
+        # cooperative_topk onto persistent_topk, so this port owns the fix.
+        #
+        # COST: this path is slower than the radix selectors. The proper fix is
+        # to pass a compressed scan bound (max_seq_len // compress_ratio) and
+        # clamp k to the compressed count, which would keep the fast selector.
+        # Not yet attempted. Eval with this workaround: 0.985 +/- 0.006, invalid
+        # 0.0000 (was 0.952 +/- 0.011 / invalid 0.0217 with the radix path).
+        # NOTE: unconditional on purpose -- worker processes do not inherit an
+        # env knob set on the API server, so gating this by env silently no-ops.
+        use_cooperative_topk = False
+        use_persistent_topk = False
+
         if use_cooperative_topk:
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
