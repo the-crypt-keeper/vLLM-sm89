@@ -601,10 +601,11 @@ def _torch_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens,
                                 block_tables, schedule_metadata,
                                 max_model_len: int,
                                 clean_logits: bool = False) -> torch.Tensor:
-    """Reference paged variant (decode): FP8 indexer cache layout
-    [num_blocks, block_size, 1, D+4] u8 — D fp8 bytes then a 4-byte f32
-    per-position scale. context_lens [B] (per-request length; draft row j
-    sees length-(next_n-1-j)) or [B, next_n] (explicit per-row lengths)."""
+    """Reference paged variant (decode): FP8 indexer cache, allocated
+    [num_blocks, block_size, 1, D+4] u8 but laid out per BLOCK, not per token
+    — block_size*D fp8 bytes, then block_size 4-byte f32 per-token scales.
+    context_lens [B] (per-request length; draft row j sees
+    length-(next_n-1-j)) or [B, next_n] (explicit per-row lengths)."""
     _warn_fallback("fp8_fp4_paged_mqa_logits")
     qv, qs = q
     if qs is not None:
@@ -640,11 +641,22 @@ def _torch_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens,
                         dtype=torch.float32, device=dev)
     wf = weights.float()
     pos = torch.arange(width, device=dev)
+    # The indexer cache is SEGREGATED within a block -- block_size*d quantized
+    # k bytes, then block_size 4-byte f32 per-token scales -- as written by
+    # `indexer_k_quant_and_cache` and read by `cp_gather_indexer_k_quant_cache`
+    # (csrc/.../cache_kernels.cu:598 and :665). Reading it as per-token
+    # [d + 4] rows takes the scale from a neighbouring token's k bytes; see the
+    # note in v1/attention/ops/triton_paged_mqa_logits_dsv4.py. This is the
+    # degrade target for that port, so it has to agree with it.
+    kv_flat = kv_cache.reshape(num_blocks, block_size * (d + 4))
+    kv_q = kv_flat[:, :block_size * d].reshape(num_blocks, block_size, d)
+    kv_s = kv_flat[:, block_size * d:].reshape(num_blocks, block_size, 4)
     for b in range(bsz):
         blocks = block_tables[b].long().clamp_(0, num_blocks - 1)
-        kb = kv_cache[blocks].reshape(width, d + 4)
-        kf = (kb[:, :d].view(torch.float8_e4m3fn).float()
-              * kb[:, d:].contiguous().view(torch.float32).view(-1, 1))
+        kq = kv_q[blocks].reshape(width, d)
+        ks = kv_s[blocks].reshape(width, 4)
+        kf = (kq.contiguous().view(torch.float8_e4m3fn).float()
+              * ks.contiguous().view(torch.float32).view(-1, 1))
         qf = qv[b].float()                                # [next_n, H, D]
         s = torch.einsum("jhd,sd->jhs", qf, kf)
         w_b = wf[b * next_n:(b + 1) * next_n]             # [next_n, H]

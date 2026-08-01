@@ -51,6 +51,302 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
+# ---------------------------------------------------------------------------
+# moet/sm89 diagnostic: decode top-k ORACLE PROBE.
+#
+# Disabled unless VLLM_DSV4_TOPK_ORACLE names an output prefix. When on, each
+# qualifying decode row is re-selected in plain PyTorch (torch.topk over that
+# row's VALID compressed columns) and every in-tree selector is scored against
+# that exact answer. The question it answers: when decode and prefill disagree
+# past 2048, is the SELECTION wrong, or are the LOGITS already different?
+#
+#   VLLM_DSV4_TOPK_ORACLE        output prefix; unset/empty = off
+#   VLLM_DSV4_TOPK_ORACLE_MIN    skip rows whose compressed seq_len is below this
+#   VLLM_DSV4_TOPK_ORACLE_MAX    stop after this many recorded rows (per rank)
+#   VLLM_DSV4_TOPK_ORACLE_LAYER  substring filter on the layer name
+#   VLLM_DSV4_TOPK_ORACLE_RADIX  1 = also run persistent_topk into a scratch
+#                                buffer and score IT against the oracle
+#   VLLM_DSV4_TOPK_ORACLE_DET    1 = recompute the logits and report whether the
+#                                kernel is bitwise reproducible on identical input
+#
+# This syncs the device, allocates, and writes a file per rank on every decode
+# step -- a bisection tool, not something to leave on. Requires
+# CUDAGRAPH_MODE=NONE: the host-side branching here cannot run inside a
+# captured graph, and under capture it would be traced once and never again.
+_ORACLE_PATH = os.environ.get("VLLM_DSV4_TOPK_ORACLE", "")
+_ORACLE_MIN = int(os.environ.get("VLLM_DSV4_TOPK_ORACLE_MIN", "0"))
+_ORACLE_MAX = int(os.environ.get("VLLM_DSV4_TOPK_ORACLE_MAX", "20000"))
+_ORACLE_LAYER = os.environ.get("VLLM_DSV4_TOPK_ORACLE_LAYER", "")
+_ORACLE_RADIX = os.environ.get("VLLM_DSV4_TOPK_ORACLE_RADIX", "0") == "1"
+_ORACLE_DET = os.environ.get("VLLM_DSV4_TOPK_ORACLE_DET", "0") == "1"
+# Number of TRAILING query rows of each prefill chunk to probe (0 = off). The
+# last row of a prefill sees exactly the context a decode step would see at the
+# same length, so its record is directly comparable to a decode record with the
+# same seq_len -- which is the whole point: bug #2 is a decode/prefill
+# divergence, and this says which side of it is wrong.
+_ORACLE_PREFILL = int(os.environ.get("VLLM_DSV4_TOPK_ORACLE_PREFILL", "0"))
+_oracle_state: dict = {"rows": 0, "step": 0, "fh": None}
+
+
+def _oracle_active(layer_name) -> bool:
+    if not _ORACLE_PATH or _oracle_state["rows"] >= _ORACLE_MAX:
+        return False
+    if _ORACLE_LAYER and _ORACLE_LAYER not in str(layer_name):
+        return False
+    return True
+
+
+def _oracle_fh():
+    fh = _oracle_state["fh"]
+    if fh is None:
+        try:
+            rank = torch.distributed.get_rank()
+        except Exception:
+            rank = os.getpid()
+        path = f"{_ORACLE_PATH}.rank{rank}.jsonl"
+        fh = open(path, "a", buffering=1)
+        _oracle_state["fh"] = fh
+        logger.info(
+            "DSv4 decode top-k ORACLE PROBE active -> %s "
+            "(min_seq=%d max_rows=%d radix=%s det=%s layer=%r)",
+            path,
+            _ORACLE_MIN,
+            _ORACLE_MAX,
+            _ORACLE_RADIX,
+            _ORACLE_DET,
+            _ORACLE_LAYER or "*",
+        )
+    return fh
+
+
+def _oracle_score_selection(sel_row, oracle_idx, oracle_vals, row, seq_len):
+    """Score one selector's row against the exact top-k for that row."""
+    k_eff = oracle_idx.numel()
+    sel = sel_row[sel_row >= 0]
+    n_pad = int(sel_row.numel() - sel.numel())
+    oob = int((sel >= seq_len).sum())
+    in_range = sel[sel < seq_len]
+    uniq = torch.unique(in_range)
+    dup = int(in_range.numel() - uniq.numel())
+    oracle_set = torch.zeros(seq_len, dtype=torch.bool, device=row.device)
+    oracle_set[oracle_idx] = True
+    hit = int(oracle_set[uniq].sum())
+    thresh = float(oracle_vals[-1])
+    got = float(row[uniq].sum()) if uniq.numel() else 0.0
+    want = float(oracle_vals.sum())
+    return {
+        "k_eff": k_eff,
+        "n_sel": int(sel.numel()),
+        "n_pad": n_pad,
+        "oob": oob,
+        "dup": dup,
+        "hit": hit,
+        "miss": k_eff - hit,
+        "exact": hit == k_eff and oob == 0 and dup == 0,
+        # score mass actually gathered vs the best possible; 1.0 means the
+        # misses were all exact ties and cost the model nothing.
+        "mass_ratio": (got / want) if want != 0.0 else None,
+        "thresh": thresh,
+        "min_sel": float(row[uniq].min()) if uniq.numel() else None,
+    }
+
+
+def _oracle_probe_slots(kv, block_table, b, cols):
+    """Read the indexer KV-cache entries backing specific candidate columns.
+
+    Layout is uint8 [num_blocks, block_size, 1, D+4]: D quantized k bytes then
+    a 4-byte little-endian f32 dequant scale. A candidate whose logit is NaN
+    can only get there through that scale (the fp8 byte decode cannot produce
+    NaN), so this says whether the slot was never written, written with a
+    degenerate scale, or written fine.
+    """
+    kvf = kv.reshape(kv.shape[0], kv.shape[1], -1)
+    block_size = kvf.shape[1]
+    D = kvf.shape[2] - 4
+    out = []
+    for c in cols:
+        blk = c // block_size
+        if blk >= block_table.shape[1]:
+            out.append({"col": c, "err": "block_table too short"})
+            continue
+        phys = int(block_table[b, blk])
+        if not (0 <= phys < kvf.shape[0]):
+            out.append({"col": c, "phys": phys, "err": "phys out of range"})
+            continue
+        ent = kvf[phys, c % block_size]
+        kb = ent[:D]
+        sb = ent[D : D + 4].to(torch.int32)
+        raw = int(sb[0] | (sb[1] << 8) | (sb[2] << 16) | (sb[3] << 24)) & 0xFFFFFFFF
+        # int32 is signed; wrap the raw uint32 before bitcasting.
+        signed = raw - 0x100000000 if raw >= 0x80000000 else raw
+        scale = float(
+            torch.tensor([signed], dtype=torch.int32).view(torch.float32)[0]
+        )
+        out.append(
+            {
+                "col": c,
+                "phys": phys,
+                "slot": c % block_size,
+                "scale_bits": f"0x{raw:08x}",
+                "scale": None if scale != scale else scale,
+                "k_nonzero": int((kb != 0).sum()),
+                "k_all_ff": int((kb == 255).sum()),
+                # full entry for the first few records: locates the scale
+                # empirically instead of trusting the assumed offset.
+                "raw": ent.tolist() if _oracle_state["rows"] < 2 else None,
+                "kv_shape": list(kv.shape) if _oracle_state["rows"] < 2 else None,
+            }
+        )
+    return out
+
+
+def _oracle_row(row, seq_len, k_select, sel_row):
+    """Per-row record: the row's health, plus the selector scored against exact
+    top-k. `row` must already be sliced to this row's VALID candidate span and
+    `sel_row` rebased so its indices are relative to that span."""
+    k_eff = min(k_select, seq_len)
+    oracle_vals, oracle_idx = torch.topk(row, k_eff)
+    thresh = float(oracle_vals[-1])
+    finite = torch.isfinite(row)
+    return {
+        "seq_len": seq_len,
+        "k": k_select,
+        "nan": int(torch.isnan(row).sum()),
+        "inf": int(torch.isinf(row).sum()),
+        # exact-tie multiplicity at the cut line: a "miss" that swaps two
+        # equal scores is not an error, it is a tiebreak difference.
+        "ties_at_thresh": int((row == thresh).sum()),
+        # WHERE the bad columns are. Recorded as distance from the end of the
+        # valid region (seq_len - 1 - col), because the suspect is the most
+        # recent compressed block: 0 = last candidate.
+        "nan_pos": (seq_len - 1 - torch.nonzero(torch.isnan(row)).flatten()[:8]).tolist(),
+        # exactly 0.0 == an all-zero (never-written) compressed cache slot:
+        # k == 0 -> every q.k dot is 0 -> relu -> acc lands on exactly 0.0.
+        "zero_pos": (seq_len - 1 - torch.nonzero(row == 0.0).flatten()[:8]).tolist(),
+        "n_zero": int((row == 0.0).sum()),
+        "finite_max": float(row[finite].max()) if int(finite.sum()) else None,
+        "finite_min": float(row[finite].min()) if int(finite.sum()) else None,
+        "n_finite": int(finite.sum()),
+        "sel": _oracle_score_selection(sel_row, oracle_idx, oracle_vals, row, seq_len),
+    }
+
+
+def _oracle_record_prefill(layer_name, logits, ks, ke, sel_buf, topk_tokens):
+    """Same measurement on the prefill side. Only the trailing rows of the
+    chunk: the last query row of a prefill sees the same context a decode step
+    at that length would."""
+    import json
+
+    fh = _oracle_fh()
+    num_rows = logits.shape[0]
+    ks_l = ks.tolist()
+    ke_l = ke.tolist()
+    for r in range(max(0, num_rows - _ORACLE_PREFILL), num_rows):
+        if _oracle_state["rows"] >= _ORACLE_MAX:
+            break
+        s, e = int(ks_l[r]), int(ke_l[r])
+        seq_len = e - s
+        if seq_len < _ORACLE_MIN or seq_len <= 0:
+            continue
+        raw = sel_buf[r]
+        sel_row = torch.where(raw >= 0, raw - s, torch.full_like(raw, -1))
+        rec = _oracle_row(logits[r, s:e].float(), seq_len, topk_tokens, sel_row)
+        rec.update(
+            {
+                "phase": "prefill",
+                "step": _oracle_state["step"],
+                "layer": str(layer_name),
+                "row": r,
+                "n_query_rows": num_rows,
+                # ks > 0 means this row's candidate span does not start at
+                # token 0 (windowing) -- only ks == 0 rows are directly
+                # comparable to a decode row of the same length.
+                "ks": s,
+                "ke": e,
+            }
+        )
+        fh.write(json.dumps(rec) + "\n")
+        _oracle_state["rows"] += 1
+    _oracle_state["step"] += 1
+
+
+def _oracle_record(
+    layer_name,
+    logits,
+    logits_dup,
+    seq_lens,
+    k_select,
+    sel_buf,
+    radix_buf,
+    num_rows,
+    next_n,
+    kv=None,
+    block_table=None,
+):
+    import json
+
+    fh = _oracle_fh()
+    step = _oracle_state["step"]
+    _oracle_state["step"] = step + 1
+
+    sl = seq_lens.reshape(-1)
+    if sl.numel() != num_rows:
+        sl = sl.repeat_interleave(max(1, num_rows // max(1, sl.numel())))
+    n_cols = logits.shape[1]
+
+    det = None
+    if logits_dup is not None:
+        diff = (logits != logits_dup) & ~(torch.isnan(logits) & torch.isnan(logits_dup))
+        det = {
+            "ne": int(diff.sum()),
+            "max_abs": float((logits - logits_dup).abs().nan_to_num().max()),
+        }
+
+    for r in range(num_rows):
+        seq_len = int(sl[r])
+        if seq_len < _ORACLE_MIN or seq_len <= 0:
+            continue
+        if _oracle_state["rows"] >= _ORACLE_MAX:
+            break
+        row = logits[r, :seq_len].float()
+        rec = _oracle_row(row, seq_len, k_select, sel_buf[r])
+        rec.update(
+            {
+                "phase": "decode",
+                "step": step,
+                "layer": str(layer_name),
+                "row": r,
+                "next_n": next_n,
+                "n_cols": n_cols,
+            }
+        )
+        # Does anything beyond the valid region carry a real value? On sm89 the
+        # Triton port allocates the logits buffer fresh and -inf-filled every
+        # call, so clean_logits=False costs nothing here -- this confirms it.
+        if seq_len < n_cols:
+            tail = logits[r, seq_len:].float()
+            tf = tail[torch.isfinite(tail)]
+            rec["tail"] = {"n": int(tail.numel()), "n_finite": int(tf.numel())}
+        if kv is not None and block_table is not None:
+            bad = [seq_len - 1 - d for d in rec["nan_pos"][:3]]
+            zero = [seq_len - 1 - d for d in rec["zero_pos"][:1]]
+            # a healthy column for contrast: the argmax is guaranteed non-NaN
+            # only if the row has finite values, so pick from the oracle set.
+            good = [int(torch.topk(torch.nan_to_num(row, nan=-1e30), 1).indices[0])]
+            rec["slots"] = {
+                "nan": _oracle_probe_slots(kv, block_table, r // max(1, next_n), bad),
+                "zero": _oracle_probe_slots(kv, block_table, r // max(1, next_n), zero),
+                "good": _oracle_probe_slots(kv, block_table, r // max(1, next_n), good),
+            }
+        if radix_buf is not None:
+            k_eff = min(k_select, seq_len)
+            ov, oi = torch.topk(row, k_eff)
+            rec["radix"] = _oracle_score_selection(radix_buf[r], oi, ov, row, seq_len)
+        if det is not None:
+            rec["logits_det"] = det
+        fh.write(json.dumps(rec) + "\n")
+        _oracle_state["rows"] += 1
+
 
 def _assert_cutedsl_dcp_merge_supported(
     logits: torch.Tensor,
@@ -525,6 +821,15 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
+                if _ORACLE_PREFILL and _oracle_active(k_cache_prefix):
+                    _oracle_record_prefill(
+                        k_cache_prefix,
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                        topk_tokens,
+                    )
 
             _merge_dcp_topk_global(
                 logits,
@@ -624,6 +929,25 @@ def sparse_attn_indexer(
                 clean_logits=False,
             )
         num_rows = logits.shape[0]
+
+        # ORACLE PROBE (off by default): is the logits kernel itself bitwise
+        # reproducible on identical input? Keep the first result before the
+        # second call -- the workspace buffer is reused, so the two would alias.
+        # (Only the VALID columns are comparable: with clean_logits=False the
+        # second pass sees the first pass's output as its stale tail.)
+        oracle_logits_dup = None
+        if _ORACLE_DET and _oracle_active(k_cache_prefix) and not current_platform.is_xpu():
+            oracle_logits_dup = logits.clone()
+            logits = fp8_fp4_paged_mqa_logits(
+                (padded_q_quant_cast, padded_q_scale),
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+                clean_logits=False,
+            )
 
         # DCP local-quota mode: select each rank's local top-(k/N) and skip
         # the per-layer cross-rank merge entirely (~21 sync points per decode
@@ -738,6 +1062,47 @@ def sparse_attn_indexer(
                 logits.stride(0),
                 logits.stride(1),
                 k_select,
+            )
+
+        if _oracle_active(k_cache_prefix):
+            # Score whatever just ran against exact top-k, and -- when every
+            # row can actually satisfy k -- run the radix selector into a
+            # scratch buffer on the SAME logits so the two are directly
+            # comparable. Scratch, never the live buffer: this must not change
+            # what the model attends to.
+            oracle_radix = None
+            if (
+                _ORACLE_RADIX
+                and not use_persistent_topk
+                and not use_cooperative_topk
+                and current_platform.is_cuda()
+                and k_select in (512, 1024, 2048)
+                and int(seq_lens.min()) >= k_select
+            ):
+                oracle_radix = torch.full_like(topk_indices, -1)
+                (oracle_ws,) = current_workspace_manager().get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.persistent_topk(
+                    logits,
+                    seq_lens,
+                    oracle_radix,
+                    oracle_ws,
+                    k_select,
+                    attn_metadata_narrowed.max_seq_len,
+                )
+            _oracle_record(
+                k_cache_prefix,
+                logits,
+                oracle_logits_dup,
+                seq_lens,
+                k_select,
+                topk_indices,
+                oracle_radix,
+                num_rows,
+                next_n,
+                kv=kv_cache,
+                block_table=decode_metadata.block_table,
             )
 
         if dcp_local_quota:

@@ -152,11 +152,36 @@ def _paged_mqa_logits_kernel(
     phys = tl.where((phys >= 0) & (phys < num_blocks), phys, 0).to(tl.int64)
 
     # Dequantize the K tile: FP8-E4M3 bytes * per-token f32 scale.
-    base = phys * stride_kv_blk + n_offs[:, None] * stride_kv_pos
+    #
+    # LAYOUT (fixed 2026-08-01, was the cause of garbage decode scores): the
+    # indexer cache is SEGREGATED within each block, not per-token
+    # interleaved. A block holds block_size*D quantized k bytes, and only
+    # then block_size 4-byte f32 scales:
+    #
+    #     [k(0) k(1) ... k(bs-1)] [scale(0) scale(1) ... scale(bs-1)]
+    #      <------ bs*D bytes ---> <------- bs*4 bytes ------------->
+    #
+    # That is what BOTH of vLLM's own kernels do -- the writer
+    # `indexer_k_quant_and_cache_kernel` (csrc/.../cache_kernels.cu:598-609)
+    # and the prefill-side gather `cp_gather_indexer_k_quant_cache_kernel`
+    # (ibid.:665-679) place k at `block*stride + pos*head_dim + d` and the
+    # scale at `block*stride + block_size*head_dim + pos*4` (for
+    # quant_block_size == head_dim, which is the DSv4 indexer's config: the
+    # entry is head_dim+4 bytes, i.e. exactly one f32 scale per token).
+    #
+    # This port previously assumed `pos*(D+4) + d` for k and `+D` for the
+    # scale. Under that reading every token past the first in a block reads k
+    # shifted by 4*pos bytes and takes its "scale" from a neighbouring token's
+    # k bytes -- so the scale is a bitcast of four FP8 bytes, typically ~1e30,
+    # sometimes a NaN pattern. Measured on the real cache: decode logits
+    # spanned 1e33 / -1e27 / NaN where the prefill path over the same tokens
+    # produced 1.1 .. 3.8.
+    blk_base = phys * stride_kv_blk
+    base = blk_base + n_offs[:, None] * D
     kb = tl.load(kv_ptr + base + d_offs[None, :], mask=n_ok[:, None],
                  other=0).to(tl.uint32)
     k = _decode_fp8_e4m3(kb)                                # [BLOCK_N, D]
-    s_base = phys * stride_kv_blk + n_offs * stride_kv_pos + D
+    s_base = blk_base + BLOCK_SIZE * D + n_offs * 4
     c0 = tl.load(kv_ptr + s_base + 0, mask=n_ok, other=0).to(tl.uint32)
     c1 = tl.load(kv_ptr + s_base + 1, mask=n_ok, other=0).to(tl.uint32)
     c2 = tl.load(kv_ptr + s_base + 2, mask=n_ok, other=0).to(tl.uint32)
@@ -298,7 +323,10 @@ def paged_mqa_logits_torch_ref(
         offs = torch.arange(next_n, device=dev, dtype=torch.int32)
         lens2d = context_lens.to(dev)[:, None] - (next_n - 1 - offs)[None, :]
     lens2d = lens2d.clamp(min=0)
-    kv = kv_cache.reshape(num_blocks, block_size, d + 4)
+    # Segregated per-block layout -- see the note in _paged_mqa_logits_kernel.
+    kv = kv_cache.reshape(num_blocks, block_size * (d + 4))
+    kv_q = kv[:, :block_size * d].reshape(num_blocks, block_size, d)
+    kv_s = kv[:, block_size * d:].reshape(num_blocks, block_size, 4)
     max_nblk = block_tables.shape[1]
     width = max_nblk * block_size
     w_cols = min(width, max_model_len)
@@ -308,9 +336,10 @@ def paged_mqa_logits_torch_ref(
     pos = torch.arange(width, device=dev)
     for b in range(bsz):
         blocks = block_tables[b].long().clamp_(0, num_blocks - 1)
-        kb = kv[blocks].reshape(width, d + 4)
-        kf = (kb[:, :d].view(torch.float8_e4m3fn).float()
-              * kb[:, d:].contiguous().view(torch.float32).view(-1, 1))
+        kq = kv_q[blocks].reshape(width, d)
+        ks = kv_s[blocks].reshape(width, 4)
+        kf = (kq.contiguous().view(torch.float8_e4m3fn).float()
+              * ks.contiguous().view(torch.float32).view(-1, 1))
         qf = qv[b].float()                                   # [next_n, H, d]
         s = torch.einsum("jhd,sd->jhs", qf, kf)
         w_b = wf[b * next_n:(b + 1) * next_n]                # [next_n, H]
@@ -324,19 +353,22 @@ def paged_mqa_logits_torch_ref(
 def pack_fp8_indexer_cache_reference(kv_rows: torch.Tensor,
                                      block_size: int) -> torch.Tensor:
     """Encode f32 rows ``[num_blocks*block_size, D]`` into the FP8 indexer
-    cache byte layout ``[num_blocks, block_size, 1, D+4]`` uint8 (per-token
-    f32 scale in the trailing 4 bytes). Reference writer for the self-test
-    and tests; saturating FP8-E4M3 so the kernel's integer decode is exact."""
+    cache byte layout ``[num_blocks, block_size, 1, D+4]`` uint8. Within each
+    block the bytes are SEGREGATED -- all block_size*D quantized k bytes, then
+    block_size 4-byte f32 per-token scales -- matching vLLM's
+    ``indexer_k_quant_and_cache``. Reference writer for the self-test and
+    tests; saturating FP8-E4M3 so the kernel's integer decode is exact."""
     n, d = kv_rows.shape
     assert n % block_size == 0
     num_blocks = n // block_size
     amax = kv_rows.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
     scale = (amax / 448.0).to(torch.float32)                 # per-token f32
     quant = (kv_rows / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
-    qb = quant.view(torch.uint8)                             # [n, d]
-    sb = scale.contiguous().view(torch.uint8).reshape(n, 4)  # [n, 4]
-    row_bytes = torch.cat([qb, sb], dim=-1)                  # [n, d+4]
-    return row_bytes.reshape(num_blocks, block_size, 1, d + 4).contiguous()
+    qb = quant.view(torch.uint8).reshape(num_blocks, block_size * d)
+    sb = scale.contiguous().view(torch.uint8).reshape(
+        num_blocks, block_size * 4)
+    blk_bytes = torch.cat([qb, sb], dim=-1)                  # [nb, bs*(d+4)]
+    return blk_bytes.reshape(num_blocks, block_size, 1, d + 4).contiguous()
 
 
 def _worst_row_rel(got: torch.Tensor, want: torch.Tensor) -> float:
@@ -392,6 +424,79 @@ def _self_test_case(device: torch.device) -> float:
     return _worst_row_rel(got, want)
 
 
+def _self_test_case_real_writer(device: torch.device) -> float:
+    """Layout cross-check against vLLM's OWN cache writer.
+
+    ``_self_test_case`` compares this port to a torch reference that reads the
+    cache the same way the port does -- so it passes whatever the layout is.
+    That is exactly how the segregated/interleaved mismatch survived: kernel,
+    reference and reference-packer all agreed with each other and all
+    disagreed with ``indexer_k_quant_and_cache``, which is what actually
+    fills the cache at runtime. Here the bytes come from that real writer, so
+    a layout drift fails instead of self-confirming.
+
+    Returns the worst row-relative error, or -1.0 if the op is unavailable.
+    """
+    from vllm import _custom_ops as vllm_ops
+
+    num_blocks, block_size, bsz, next_n, H, D = 4, 64, 2, 1, 32, 128
+    max_model_len = 128
+    n_tok = num_blocks * block_size
+    kv_cache = torch.zeros(num_blocks, block_size, 1, D + 4,
+                           dtype=torch.uint8, device=device)
+    k_rows = (torch.randn(n_tok, D, device=device, dtype=torch.bfloat16) * 2.0)
+    slot_mapping = torch.arange(n_tok, device=device, dtype=torch.int64)
+    try:
+        # quant_block_size == head_dim -> exactly one f32 scale per token,
+        # which is the DSv4 indexer's configuration.
+        vllm_ops.indexer_k_quant_and_cache(k_rows, kv_cache, slot_mapping, D,
+                                           "fp8_e4m3")
+    except Exception as exc:                                  # pragma: no cover
+        logger.warning_once(
+            "DSv4 paged-MQA-logits: real-writer layout cross-check skipped "
+            "(%s: %s)", type(exc).__name__, exc)
+        return -1.0
+    q = (torch.randn(bsz, next_n, H, D, device=device, dtype=torch.float32)
+         ).clamp(-448, 448).to(torch.float8_e4m3fn)
+    weights = torch.randn(bsz * next_n, H, device=device, dtype=torch.float32)
+    context_lens = torch.tensor([[100], [128]], device=device,
+                                dtype=torch.int32)
+    max_blocks = -(-max_model_len // block_size)
+    block_tables = torch.zeros(bsz, max_blocks, device=device,
+                               dtype=torch.int32)
+    for b in range(bsz):
+        # deliberately NOT identity: a layout bug that only shows up when the
+        # logical and physical block index differ would otherwise hide.
+        block_tables[b, :max_blocks] = torch.arange(
+            max_blocks, device=device, dtype=torch.int32) + b
+    got = paged_mqa_logits_dsv4_triton(
+        q_values=q, kv_cache=kv_cache, weights=weights,
+        context_lens=context_lens, block_tables=block_tables,
+        max_model_len=max_model_len)
+
+    # Ground truth from the PRE-quantization k, never touching the cache. The
+    # only comparison that is independent of the layout: a reference that
+    # reads the cache would share whatever assumption the kernel makes and
+    # agree with it either way (which is the trap this test exists to avoid).
+    width = max_blocks * block_size
+    pos = torch.arange(width, device=device)
+    want = torch.full((bsz * next_n, max_model_len), float("-inf"),
+                      dtype=torch.float32, device=device)
+    for b in range(bsz):
+        phys = (block_tables[b].long()[pos // block_size] * block_size
+                + pos % block_size).clamp_(0, n_tok - 1)
+        kf = k_rows[phys].float()                            # [width, D]
+        s = torch.einsum("jhd,sd->jhs", q[b].float(), kf)
+        w_b = weights[b * next_n:(b + 1) * next_n].float()
+        row = (torch.relu(s) * w_b[:, :, None]).sum(1)       # [next_n, width]
+        row = row.masked_fill(
+            pos[None, :] >= context_lens[b].to(device)[:, None].clamp(min=0),
+            float("-inf"))
+        cols = min(width, max_model_len)
+        want[b * next_n:(b + 1) * next_n, :cols] = row[:, :cols]
+    return _worst_row_rel(got, want)
+
+
 @functools.cache
 def dsv4_paged_mqa_logits_self_test() -> None:
     """One-shot on-device self-test; enables the kernel iff it matches the
@@ -415,6 +520,28 @@ def dsv4_paged_mqa_logits_self_test() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     worst = _self_test_case(device)
     cap = torch.cuda.get_device_capability(device)
+    # Layout gate. Quantization noise only (k is fp8-e4m3 with a per-token
+    # scale, q is fp8 on both sides), so a correct read lands near 1e-2 while
+    # a layout mismatch is O(1) or worse.
+    layout = _self_test_case_real_writer(device)
+    # NaN-safe: a wrong layout reads bitcast FP8 bytes as the dequant scale
+    # and the error comes back NaN, and `nan > 8e-2` is False. Gate on the
+    # PASS condition so anything not provably small fails.
+    if layout != -1.0 and not layout <= 8e-2:
+        _KERNEL_TRUSTED = False
+        logger.error(
+            "DSv4 paged-MQA-logits LAYOUT CHECK FAILED on sm_%d%d: "
+            "worst_row_rel=%.3e vs f32 ground truth over a cache filled by "
+            "vLLM's own indexer_k_quant_and_cache (threshold 8e-2). The port "
+            "is reading the indexer KV cache with the wrong byte layout - "
+            "keeping the torch reference. Note the reference reads the cache "
+            "the same way, so it is NOT known-good here either.",
+            cap[0], cap[1], layout)
+        return
+    if layout >= 0.0:
+        logger.info(
+            "DSv4 paged-MQA-logits layout check vs vLLM's own cache writer: "
+            "worst_row_rel=%.3e (f32 ground truth)", layout)
     if worst <= 3e-2:
         _KERNEL_TRUSTED = True
         logger.info(
