@@ -651,39 +651,52 @@ def sparse_attn_indexer(
             1024,
             2048,
         )
-        # sm89 (Ada) correctness fix, 2026-08-01.
+        # sm89 (Ada) correctness fix, 2026-08-01. DO NOT re-enable the radix
+        # selectors (cooperative_topk / persistent_topk) without reading this.
         #
-        # The compiled radix selectors (cooperative_topk / persistent_topk) take
-        # a scan bound over the logits columns as their last argument, and the
-        # DSV4 call site hands them `common_attn_metadata.max_seq_len` -- the
-        # UNCOMPRESSED sequence length -- while `seq_lens` in the same call has
-        # already been divided by `compress_ratio` (see mla/indexer.py). For the
-        # compress_ratio=4 layers that bound is 4x too large, so columns past the
-        # valid compressed region are eligible for selection. It is harmless
-        # while the compressed candidate count stays <= index_topk (everything
-        # valid is taken anyway) and starts corrupting the selection the moment
-        # real ranking begins -- i.e. at compressed count 512, absolute context
-        # position 2048. Measured signature: a NaN logits row at position ~2053
-        # that makes the sampler emit BOS mid-stream and collapses the rest of
-        # the generation into token salad.
+        # They are unsafe here for TWO independent reasons. Fixing only the
+        # first moves the crash, it does not remove it -- measured, not argued:
         #
-        # `top_k_per_row_decode` takes no such bound (it can only clamp per row
-        # by the compressed `seq_lens`), so routing to it is correct by
-        # construction. All four independent implementations agree on the
-        # invariant that the candidate axis must be exactly the compressed count:
-        # DeepSeek's own inference/model.py:433
-        # (`topk(min(index_topk, end_pos // ratio))`), antirez/DS.cpp ds4.c:12886,
-        # llama.cpp deepseek4.cpp:613, and SGLang dsv4/indexer.py:296.
+        # (1) SCAN BOUND UNITS -- fixed at source in `mla/indexer.py`
+        #     (`if self.compress_ratio > 1: max_seq_len //= ...`). The bound
+        #     used to arrive UNCOMPRESSED while `seq_lens` in the same call was
+        #     already compressed, so up to 4x too many columns were eligible and
+        #     stale data (the logits buffer is built with clean_logits=False)
+        #     ranked against real candidates. Symptom: NaN logits row at
+        #     absolute position ~2053 -- compressed count 513, i.e. the first
+        #     step where real ranking happens -> sampler emits BOS with a null
+        #     logprob -> the rest of the generation collapses into token salad.
         #
-        # The defective code is stock vLLM 0.25.1, but nothing upstream claims
-        # sm89 support here: the capability-90 gate is what drops us off
-        # cooperative_topk onto persistent_topk, so this port owns the fix.
+        # (2) `k_select` IS NEVER CLAMPED to the compressed candidate count, and
+        #     this is still unfixed. With (1) corrected and the selectors turned
+        #     back on, the NaN simply MOVED DOWN to absolute position 1772 --
+        #     compressed count 443 < k=512. The kernel is asked for 512 items
+        #     from 443 valid columns and cannot fill them. Before (1) was fixed,
+        #     the 4x-too-wide bound accidentally guaranteed >= 512 columns to
+        #     draw from, which is precisely why the failure used to start only
+        #     above 2048. Verified 2026-08-01: NaN in 1/8 generations.
         #
-        # COST: this path is slower than the radix selectors. The proper fix is
-        # to pass a compressed scan bound (max_seq_len // compress_ratio) and
-        # clamp k to the compressed count, which would keep the fast selector.
-        # Not yet attempted. Eval with this workaround: 0.985 +/- 0.006, invalid
-        # 0.0000 (was 0.952 +/- 0.011 / invalid 0.0217 with the radix path).
+        # All four reference implementations clamp -- DeepSeek's own
+        # inference/model.py:433 `topk(min(index_topk, end_pos // ratio))`,
+        # antirez/DS.cpp ds4.c:12886, llama.cpp deepseek4.cpp:613, SGLang
+        # dsv4/indexer.py:296. vLLM is the only one that does not.
+        #
+        # The clamp is PER ROW while these kernels take a scalar k, so a correct
+        # re-enable needs a gate like "every row in this decode batch has >= k
+        # valid compressed candidates". That needs an exact host-side minimum;
+        # `common_attn_metadata.seq_lens_cpu_upper_bound` is an UPPER bound and
+        # is therefore the wrong direction for such a gate.
+        #
+        # `top_k_per_row_decode` takes no scan bound and clamps per row via the
+        # compressed `seq_lens`, so it is correct by construction for both
+        # regimes. It is slower; correctness first. Eval with this path:
+        # 0.985 +/- 0.006, invalid 0.0000 (radix path: 0.952 +/- 0.011,
+        # invalid 0.0217).
+        #
+        # KNOWN RESIDUAL: decode/prefill selection still diverges past 2048 and
+        # compounds with depth, stalling termination past ~6K generated tokens
+        # (bug #2 in CLAUDE-TP8.md). This path fixed the NaN, not that.
+        #
         # NOTE: unconditional on purpose -- worker processes do not inherit an
         # env knob set on the API server, so gating this by env silently no-ops.
         use_cooperative_topk = False

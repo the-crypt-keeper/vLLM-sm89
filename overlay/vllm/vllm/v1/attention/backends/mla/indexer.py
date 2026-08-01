@@ -830,6 +830,45 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # bound over logits columns; under DCP those columns cover only the
         # local shard, so hand the kernels the (exact) local maximum.
         max_seq_len = common_attn_metadata.max_seq_len
+        # moet/sm89: for DeepseekV4 (compress_ratio > 1) the indexer's logits
+        # columns are COMPRESSED candidates, and `seq_lens` above has already
+        # been divided by compress_ratio. This bound had not been, so the
+        # decode top-k selectors were handed a scan window up to
+        # compress_ratio-times wider than the valid candidate region and
+        # ranked stale columns alongside real ones (the logits buffer is
+        # produced with clean_logits=False, so the tail is last step's data).
+        #
+        # Harmless while the compressed count <= index_topk (512): everything
+        # valid is taken regardless of order. It first bites the moment real
+        # ranking begins -- compressed count L/4 crosses 512 at L=2048 -- which
+        # is exactly where both observed defects start:
+        #   * NaN logits at absolute position ~2053 -> BOS with null logprob ->
+        #     token salad (fixed 2026-08-01 by routing off the radix selectors)
+        #   * decode/prefill selection divergence past 2048 that compounds with
+        #     depth and stalls termination past ~6K generated tokens (bug #2)
+        # Both are the same units mismatch, two severities apart.
+        #
+        # All four independent implementations use the compressed count as the
+        # candidate axis: DeepSeek's reference `topk(min(index_topk,
+        # end_pos // ratio))` (inference/model.py:415-440), DS.cpp
+        # (ds4.c:12886), llama.cpp (deepseek4.cpp:613), SGLang
+        # (dsv4/indexer.py:296-329). vLLM was the odd one out.
+        #
+        # Divide before the DCP localisation below; the two are mutually
+        # exclusive anyway (the builder raises NotImplementedError for
+        # dcp_world_size > 1 with compress_ratio > 1), so ordering is moot.
+        #
+        # NECESSARY BUT NOT SUFFICIENT, and currently INERT. The only consumers
+        # of this field are the two radix selectors in sparse_attn_indexer.py,
+        # and those are disabled because `k_select` is still never clamped to
+        # the compressed candidate count. Correcting this bound alone just moves
+        # the NaN from absolute position ~2053 (compressed 513, one above k) to
+        # 1772 (compressed 443, below k) -- measured 2026-08-01. Keep this fix;
+        # it is required before the radix path can ever be re-enabled, but it
+        # does not by itself make that path safe. Full write-up at the
+        # `use_cooperative_topk = False` block in sparse_attn_indexer.py.
+        if self.compress_ratio > 1:
+            max_seq_len //= self.compress_ratio
         if self.dcp_world_size > 1:
             max_seq_len = dcp_local_count_int(
                 max_seq_len,
