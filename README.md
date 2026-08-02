@@ -1,6 +1,7 @@
 # DeepSeek-V4-Flash on Ada (sm89) — validated, not just running
 
-This fork serves **DeepSeek-V4-Flash (159B MoE)** on **NVIDIA L40S / Ada (sm_89)**
+This fork serves **DeepSeek-V4-Flash (304B total, ~12.7B activated)** on
+**NVIDIA L40S / Ada (sm_89)**
 using the checkpoint's **stock MXFP4 experts through Marlin** — no exotic
 quantization, no 2-bit codebooks, no hand-written SASS. Base is official vLLM
 **v0.25.1** at commit `752a3a504` plus generated per-file patches from `patches/`.
@@ -159,8 +160,27 @@ the encoder that ships with the checkpoint, verified byte-identical at
 ## Hardware
 
 Validated on **8x L40S** (sm_89, 48 GB, ECC off) and **4x L40S** (ECC on).
-Anything Ada with enough VRAM should work; the checkpoint is 156 GB, so plan
-~40 GB/card at TP4 or ~21 GB/card at TP8.
+Anything Ada with enough VRAM should work; the checkpoint is 156 GB on disk, so
+plan ~40 GB/card at TP4 or ~21 GB/card at TP8.
+
+**Don't read the disk size as a parameter count.** The routed experts are MXFP4
+stored two values per byte (`I8` container, `[2048, 2048]` for a logically
+`[2048, 4096]` matrix, with an `F8_E8M0` scale per 32 elements), so bytes are
+roughly *half* the parameters. Counted from the safetensors headers:
+
+| | params |
+|---|---:|
+| main experts (43 layers x 257 experts) | 278.11 B |
+| main attention / indexer / norms | 5.17 B |
+| embeddings + lm_head | 1.06 B |
+| **main model** | **284.33 B** |
+| DSpark draft module (`mtp.*`, 19.40 B of it experts) | 19.85 B |
+| **total** | **304.18 B** |
+
+Which matches the model card's 304B. Per token, 6 of 256 routed experts plus the
+shared one activate: **~12.7 B**. The DSpark draft module is loaded but unused
+here — `SPEC=none` is the default, and speculative decoding is unverified on the
+Marlin path.
 
 | | 4x L40S (ECC on) | 8x L40S (ECC off) |
 |---|---|---|
