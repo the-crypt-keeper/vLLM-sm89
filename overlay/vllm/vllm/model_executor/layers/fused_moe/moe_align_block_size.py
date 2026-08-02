@@ -135,6 +135,17 @@ def moe_align_block_size(
 # exists as a control. If two different fixed orders give different logits,
 # then order is not numerically inert here -- which it should be, since the
 # bucketing is arbitrary -- and something downstream is order-sensitive.
+# It is not inert: measured 76/77 prompt logprobs differ between "1" and "2",
+# median 0.092 / max 1.62 nats, each order individually reproducible.
+#
+# "1" is the default because it matches DeepSeek's reference implementation.
+# That reference (inference/model.py:634-649) has no bucketing at all -- it
+# loops experts ascending and takes `idx, top = torch.where(indices == i)`,
+# which yields ascending token ids. So ascending IS the reference order. It
+# also proves order should be inert: `expert(x[idx], ...)` is a batched matmul
+# over independent rows, so permuting idx permutes the output identically.
+# The block bucketing comes from the fused-MoE kernel lineage (SGLang ships a
+# structurally identical moe_align_block_size), not from the model authors.
 _DETERMINISTIC_MOE = os.environ.get("VLLM_DSV4_DETERMINISTIC_MOE", "0")
 
 

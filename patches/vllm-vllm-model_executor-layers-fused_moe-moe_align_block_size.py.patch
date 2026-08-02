@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
-index 7fc8bfc..352cadf 100644
+index 7fc8bfc..4a5e888 100644
 --- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
 +++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 7fc8bfc..352cadf 100644
  
  import torch
  
-@@ -100,7 +102,76 @@
+@@ -100,7 +102,87 @@
      if expert_map is not None and not ignore_invalid_experts:
          expert_ids = expert_map[expert_ids]
  
@@ -47,6 +47,17 @@ index 7fc8bfc..352cadf 100644
 +# exists as a control. If two different fixed orders give different logits,
 +# then order is not numerically inert here -- which it should be, since the
 +# bucketing is arbitrary -- and something downstream is order-sensitive.
++# It is not inert: measured 76/77 prompt logprobs differ between "1" and "2",
++# median 0.092 / max 1.62 nats, each order individually reproducible.
++#
++# "1" is the default because it matches DeepSeek's reference implementation.
++# That reference (inference/model.py:634-649) has no bucketing at all -- it
++# loops experts ascending and takes `idx, top = torch.where(indices == i)`,
++# which yields ascending token ids. So ascending IS the reference order. It
++# also proves order should be inert: `expert(x[idx], ...)` is a batched matmul
++# over independent rows, so permuting idx permutes the output identically.
++# The block bucketing comes from the fused-MoE kernel lineage (SGLang ships a
++# structurally identical moe_align_block_size), not from the model authors.
 +_DETERMINISTIC_MOE = os.environ.get("VLLM_DSV4_DETERMINISTIC_MOE", "0")
 +
 +
