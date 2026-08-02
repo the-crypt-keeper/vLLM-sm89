@@ -1,0 +1,44 @@
+diff --git a/vllm/entrypoints/chat_utils.py b/vllm/entrypoints/chat_utils.py
+index f0b56da..1f08907 100644
+--- a/vllm/entrypoints/chat_utils.py
++++ b/vllm/entrypoints/chat_utils.py
+@@ -346,7 +346,12 @@
+     """The reasoning content for interleaved thinking."""
+ 
+     tools: list[ChatCompletionFunctionToolParam] | None
+-    """The tools for developer role."""
++    """Message-level tools, preserved for "system" and "developer" roles.
++
++    Used by chat templates/encoders (e.g. DeepSeek-V4, DeepSeek-V3.2) that
++    accept tools attached directly to a system or developer message, as
++    opposed to (or in addition to) the request-level `tools` parameter.
++    """
+ 
+     task: str | None
+     """Model-specific task marker. Currently passed through for DeepSeek V4."""
+@@ -383,7 +388,12 @@
+     """Deprecated: The reasoning content for interleaved thinking."""
+ 
+     tools: list[ChatCompletionFunctionToolParam] | None
+-    """The tools for developer role."""
++    """Message-level tools, preserved for "system" and "developer" roles.
++
++    Used by chat templates/encoders (e.g. DeepSeek-V4, DeepSeek-V3.2) that
++    accept tools attached directly to a system or developer message, as
++    opposed to (or in addition to) the request-level `tools` parameter.
++    """
+ 
+     task: str | None
+     """Model-specific task marker. Currently passed through for DeepSeek V4."""
+@@ -1812,7 +1822,10 @@
+         if "task" in message and isinstance(message["task"], str):
+             result_msg["task"] = message["task"]
+ 
+-        if role == "developer":
++        # DSV4 and DSV3.2 both read msg["tools"] when rendering a *system*
++        # message (deepseek_v4_encoding.render_message, deepseek_v32_encoding),
++        # so restricting the passthrough to "developer" silently dropped them.
++        if role in ("system", "developer"):
+             result_msg["tools"] = message.get("tools", None)
+     return result
+ 
