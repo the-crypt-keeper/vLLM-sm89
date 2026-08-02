@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index ceb52e5..c011cac 100644
+index ceb52e5..973c9c6 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -1,6 +1,8 @@
@@ -24,7 +24,7 @@ index ceb52e5..c011cac 100644
  from vllm.v1.worker.workspace import current_workspace_manager
  
  logger = init_logger(__name__)
-@@ -42,6 +50,302 @@
+@@ -42,6 +50,313 @@
  
  # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
  MXFP4_BLOCK_SIZE = 32
@@ -63,6 +63,15 @@ index ceb52e5..c011cac 100644
 +# same seq_len -- which is the whole point: bug #2 is a decode/prefill
 +# divergence, and this says which side of it is wrong.
 +_ORACLE_PREFILL = int(os.environ.get("VLLM_DSV4_TOPK_ORACLE_PREFILL", "0"))
++# 1 = also dump the RAW selected index vector, in emission order, as "sel_idx".
++# The scored `sel` field only ever answers "is this the right SET" -- it is
++# computed against torch.topk and reports hit/miss/dup counts, so two runs that
++# select the same 512 candidates in a DIFFERENT ORDER both score exact:true and
++# look identical. The sparse-MLA attention accumulates candidates in index
++# order and float addition is not associative, so order is not free: a permuted
++# but equal set shifts the output by ~1 bf16 ULP (measured). This dumps the
++# vector itself so two runs can be diffed ELEMENT-WISE rather than as sets.
++_ORACLE_RAW = os.environ.get("VLLM_DSV4_TOPK_ORACLE_RAW", "0") == "1"
 +_oracle_state: dict = {"rows": 0, "step": 0, "fh": None}
 +
 +
@@ -243,6 +252,8 @@ index ceb52e5..c011cac 100644
 +                "ke": e,
 +            }
 +        )
++        if _ORACLE_RAW:
++            rec["sel_idx"] = sel_row.tolist()
 +        fh.write(json.dumps(rec) + "\n")
 +        _oracle_state["rows"] += 1
 +    _oracle_state["step"] += 1
@@ -327,7 +338,7 @@ index ceb52e5..c011cac 100644
  
  
  def _assert_cutedsl_dcp_merge_supported(
-@@ -291,6 +595,36 @@
+@@ -291,6 +606,36 @@
      return kv_cache.unsqueeze(-2)
  
  
@@ -364,7 +375,7 @@ index ceb52e5..c011cac 100644
  @eager_break_during_capture
  def sparse_attn_indexer(
      hidden_states: torch.Tensor,
-@@ -313,6 +647,8 @@
+@@ -313,6 +658,8 @@
      dcp_world_size: int = 1,
      cp_kv_cache_interleave_size: int = 1,
      skip_topk_buffer_clear: bool = False,
@@ -373,7 +384,7 @@ index ceb52e5..c011cac 100644
  ) -> torch.Tensor:
      # careful! this will be None in dummy run
      attn_metadata = get_forward_context().attn_metadata
-@@ -355,6 +691,9 @@
+@@ -355,6 +702,9 @@
              topk_indices_buffer,
              skip_k_cache_insert,
              use_fp4_cache,
@@ -383,7 +394,7 @@ index ceb52e5..c011cac 100644
          )
      attn_metadata_narrowed = attn_metadata[k_cache_prefix]
      assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
-@@ -482,6 +821,15 @@
+@@ -482,6 +832,15 @@
                      logits.stride(1),
                      topk_tokens,
                  )
@@ -399,7 +410,7 @@ index ceb52e5..c011cac 100644
  
              _merge_dcp_topk_global(
                  logits,
-@@ -492,6 +840,17 @@
+@@ -492,6 +851,17 @@
                  cp_kv_cache_interleave_size,
                  row_starts=chunk.cu_seqlen_ks,
              )
@@ -417,7 +428,7 @@ index ceb52e5..c011cac 100644
  
      if has_decode:
          decode_metadata = attn_metadata_narrowed.decode
-@@ -570,21 +929,103 @@
+@@ -570,21 +940,103 @@
                  clean_logits=False,
              )
          num_rows = logits.shape[0]
@@ -524,7 +535,7 @@ index ceb52e5..c011cac 100644
          if use_cooperative_topk:
              workspace_manager = current_workspace_manager()
              (topk_workspace,) = workspace_manager.get_simultaneous(
-@@ -595,7 +1036,7 @@
+@@ -595,7 +1047,7 @@
                  seq_lens,
                  topk_indices,
                  topk_workspace,
@@ -533,7 +544,7 @@ index ceb52e5..c011cac 100644
                  attn_metadata_narrowed.max_seq_len,
              )
          elif use_persistent_topk:
-@@ -608,8 +1049,8 @@
+@@ -608,8 +1060,8 @@
                  seq_lens,
                  topk_indices,
                  topk_workspace,
@@ -544,7 +555,7 @@ index ceb52e5..c011cac 100644
              )
          else:
              ops.top_k_per_row_decode(
-@@ -620,7 +1061,74 @@
+@@ -620,7 +1072,74 @@
                  num_rows,
                  logits.stride(0),
                  logits.stride(1),
@@ -620,7 +631,7 @@ index ceb52e5..c011cac 100644
              )
  
          if decode_metadata.global_seq_lens is not None:
-@@ -668,6 +1176,8 @@
+@@ -668,6 +1187,8 @@
      dcp_world_size: int = 1,
      cp_kv_cache_interleave_size: int = 1,
      skip_topk_buffer_clear: bool = False,
@@ -629,7 +640,7 @@ index ceb52e5..c011cac 100644
  ) -> torch.Tensor:
      return topk_indices_buffer
  
-@@ -731,6 +1241,46 @@
+@@ -731,6 +1252,46 @@
                  "the current vLLM environment."
              )
  
@@ -676,7 +687,7 @@ index ceb52e5..c011cac 100644
      def forward_native(
          self,
          hidden_states: torch.Tensor,
-@@ -781,6 +1331,7 @@
+@@ -781,6 +1342,7 @@
              self.dcp_rank,
              self.dcp_world_size,
              self.cp_kv_cache_interleave_size,
@@ -684,7 +695,7 @@ index ceb52e5..c011cac 100644
          )
  
      def forward_xpu(
-@@ -800,6 +1351,9 @@
+@@ -800,6 +1362,9 @@
          weights: torch.Tensor,
      ):
          assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"

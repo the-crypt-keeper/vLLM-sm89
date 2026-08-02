@@ -419,14 +419,58 @@ Every other candidate is excluded: kernel race (ruled out above), tie-breaking
 not move with `BATCHED_TOKENS`), and masking below the boundary (logits are
 genuinely identical at 512).
 
-**Still unproven, and it is the one remaining link:** that the selector actually
-emits a *varying order* for the same set above the boundary. Everything else is
-measured; this is inferred by elimination. Confirm by dumping the raw
-`topk_indices` for two identical requests and comparing **element-wise, not as a
-set** — the oracle's `exact: true` only ever checked set membership, which is
-exactly why this hid. If confirmed, the fix is to sort the selected indices
-before the attention consumes them (canonical order), the same remedy shape as
-bug #3's `moe_align` canonicalisation.
+### THE ORDER HYPOTHESIS IS DEAD (2026-08-02) — raw index dump, element-wise
+Added `VLLM_DSV4_TOPK_ORACLE_RAW=1` (dumps the selected index vector in emission
+order as `sel_idx`) and diffed two identical ctx-2047 requests element-wise
+rather than as sets:
+
+| layer | logits | selection vector | positions differing |
+|---|---|---|---|
+| **2** | **same** | **IDENTICAL** | **0 / 512** |
+| 4 | DIFF | different set | 497 |
+| 6 | DIFF | same set, reordered | 388 |
+| 10 | DIFF | different set | 310 |
+| … | DIFF | 10 reordered / 10 different-set | – |
+
+**At layer 2 — the first indexer layer, and the one where the injection happens —
+the indexer is completely deterministic: identical logits AND an identical index
+vector, same set and same order.** The attention still diverges there. So
+ordering is not the trigger. The reordering and set changes from layer 4 down are
+*consequences* of logits that already differ, not causes.
+
+The kernel is cleared as well, now including engine page size:
+
+| pbs | n_extra 512 / 515 / 516 | distinct outputs | poison leak |
+|---|---|---|---|
+| 64 | all | 1 | 0 |
+| **256** (engine `BLOCK_SIZE`) | all | 1 | 0 |
+
+### Where bug #5 actually stands
+Established: the injection is in `layers.2.attn`, between `wq_b` and `wo_b`,
+with **identical `q`** (wq_b bit-identical) and **identical selection indices**
+(dumped and diffed), feeding a kernel that is **deterministic on identical
+inputs** at every geometry tested. Those three facts together leave exactly one
+unexamined input: **the KV cache contents**, which are mutated in place and are
+therefore invisible to a module-output fingerprint — the same blind spot that
+hid bug #2.
+
+**Next step:** fingerprint the KV cache tensors themselves (compressed and SWA)
+immediately before layer 2's attention read, on two identical requests. If they
+differ, the defect is in the quantise-and-write path, not the read path. Also
+worth checking whether a *separate* main/SWA selection exists that `sel_idx`
+does not cover — the dump comes from the `top_k_per_row_prefill` call site only.
+
+Excluded so far, each by measurement: kernel race, index ordering, tie-breaking
+(0 ties at the cut), the MoE (twice), chunked prefill (boundary invariant to
+`BATCHED_TOKENS`), masking below the boundary (logits genuinely identical at
+512), and unwritten `out` elements (poison probe clean).
+
+**Latent hazard recorded separately:** the sparse-MLA attention *is*
+order-sensitive (~1 bf16 ULP under permutation of an equal index set, measured
+at 256/512/516/1024 candidates). That is not what is biting here, because layer
+2's order is stable — but any future change that makes selection order vary will
+inject exactly this cascade, so canonicalising the indices is worth doing
+defensively regardless of the root cause.
 
 ### Superseded: the tie-breaking hypothesis and the oracle plan
 `VLLM_DSV4_TOPK_ORACLE` with `_DET=1` recomputes the logits and reports whether

@@ -85,6 +85,15 @@ _ORACLE_DET = os.environ.get("VLLM_DSV4_TOPK_ORACLE_DET", "0") == "1"
 # same seq_len -- which is the whole point: bug #2 is a decode/prefill
 # divergence, and this says which side of it is wrong.
 _ORACLE_PREFILL = int(os.environ.get("VLLM_DSV4_TOPK_ORACLE_PREFILL", "0"))
+# 1 = also dump the RAW selected index vector, in emission order, as "sel_idx".
+# The scored `sel` field only ever answers "is this the right SET" -- it is
+# computed against torch.topk and reports hit/miss/dup counts, so two runs that
+# select the same 512 candidates in a DIFFERENT ORDER both score exact:true and
+# look identical. The sparse-MLA attention accumulates candidates in index
+# order and float addition is not associative, so order is not free: a permuted
+# but equal set shifts the output by ~1 bf16 ULP (measured). This dumps the
+# vector itself so two runs can be diffed ELEMENT-WISE rather than as sets.
+_ORACLE_RAW = os.environ.get("VLLM_DSV4_TOPK_ORACLE_RAW", "0") == "1"
 _oracle_state: dict = {"rows": 0, "step": 0, "fh": None}
 
 
@@ -265,6 +274,8 @@ def _oracle_record_prefill(layer_name, logits, ks, ke, sel_buf, topk_tokens):
                 "ke": e,
             }
         )
+        if _ORACLE_RAW:
+            rec["sel_idx"] = sel_row.tolist()
         fh.write(json.dumps(rec) + "\n")
         _oracle_state["rows"] += 1
     _oracle_state["step"] += 1
