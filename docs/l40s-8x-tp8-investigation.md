@@ -51,10 +51,12 @@ the long-context path. A 2-14k prompt sweep is the instrument for that, and it
 needs sub-2048 points as a control (below 2048 the indexer top-k is a no-op,
 which is exactly why those bugs stayed invisible for so long).
 
-## EXPERIMENT IN FLIGHT (started 2026-08-02 evening): fp32 sparse-MLA dot
+## RESOLVED NULL (2026-08-02): fp32 sparse-MLA dot — synthetic error down, no functional difference
 
-**Status: running. Result not yet in.** Serving as `deepseek-v4-flash-dotf32`,
-log `logs/tp8-dotf32.log`.
+**Status: done. No movement.** Per the pre-registered rule below, the dot was
+not the lever: drop it and go to int8 KV. Served as `deepseek-v4-flash-dotf32`,
+log `logs/tp8-dotf32.log`. Result and the general principle it establishes are
+in "The result" and "Why this closes the numerics family", below.
 
 ### The change
 `VLLM_DSV4_MLA_DOT_FP32=1` (launcher: `MLA_DOT=fp32`) runs the sparse-MLA
@@ -125,6 +127,84 @@ Baselines to beat — **cloud scores the same 0.837 ± 0.016** (n=1963) with
   its own evidence. Cloud is a correctness reference, not a precision ceiling.
 - **Local degrades** -> suspect the `BLOCK_N=16` tiling, not the precision.
 
+### The result: null on every readout that matters
+`sequence` @ 16k budget, reasoning effort High, adjusted 95% CI:
+
+| arm | n | score | trunc | mean completion |
+|---|---|---|---|---|
+| local, bf16 dot (baseline) | 1978 | **0.837 ± 0.016** | 8.43% | 4053.5 |
+| local, fp32 dot | 1959 | **0.837 ± 0.016** | 9.31% | 4288.6 |
+| cloud API | 1963 | **0.837 ± 0.016** | 9.1% | 4562 |
+
+Three arms, same score to three decimals. The synthetic error *did* go down
+(self-test `7.634e-03 -> 6.849e-03`); nothing downstream noticed.
+
+The length metrics move toward cloud (completions 4054 -> 4289 against cloud's
+4562; truncation 8.43% -> 9.31% against cloud's 9.1%), which is suggestive and
+is **not** claimed as signal. The pooled tail detail shows why:
+
+![Ignorance region over token time, three arms pooled](img/dsv4-flash-tail-detail-pooled.png)
+
+n=2160 per arm, budget 16.1k. The distribution barely shifts; the mean is
+dragged by an enormous long tail, so mean completion length is a tail statistic
+here, not a location statistic. Do not run a t-test on it.
+
+What the figure *does* establish is stronger than the thing it fails to show.
+Among everything that resolves inside the budget, the correct:incorrect ratio is
+identical across all three arms:
+
+| arm | correct | incorrect | ignorance @ budget | correct:incorrect |
+|---|---|---|---|---|
+| API, High | 76.0% | 14.8% | 9.2pp | **5.14** |
+| local fp32 dot, High | 75.9% | 14.8% | 9.4pp | **5.13** |
+| local bf16 dot, High | 76.6% | 14.9% | 8.5pp | **5.14** |
+
+The arms differ *only* in how much mass has not resolved yet, and local is on
+the favourable side of cloud on that. Unresolved-at-budget is a budget artifact,
+not a capability difference.
+
+**This also answers the 32k question without running it.** Extending the budget
+converts grey into blue and red at a ratio that is already measured, and already
+identical across arms. A 32k run relabels the same mass in all three panels at
+5.14:1 and cannot discriminate. It is not worth 2-3 h/arm.
+
+### Why this closes the numerics family
+Bug #4 calibrated the sensitivity: 1 bf16 ULP in an expert output moves prompt
+logprobs ~0.09 nats median, 2.1 max. Yet this eval cannot see an intervention
+that measurably reduced attention-dot error, and the 26,901-prompt head-to-head
+puts us at -0.003 ± 0.012 against a cloud arm that is very likely a different
+expert quantization on different silicon.
+
+Those coexist because the perturbation is **non-directional**. It is diffusion,
+not drift: large in logprob space, mean-centred, so it does not accumulate into
+systematic task error. That is the line the four bugs fall on, and it is the
+reason the method worked:
+
+- **Bugs #1-#3 were directional.** A wrong byte layout biases the top-512
+  selection the same way every time and compounds with depth; a race biases
+  nothing but destroys reproducibility outright. Bias survives averaging, so a
+  behavioural oracle (cloud) resolved all three — 11/40 truncations vs cloud's
+  0/40, p = 0.0129.
+- **Bug #4 and this experiment are symmetric.** Reassociation and rounding have
+  no preferred direction, so they are invisible at task level *by construction*.
+  No amount of eval sensitivity changes that, because there is no bias to detect.
+
+**Cloud discriminates bias. It cannot discriminate variance.** That is the
+general statement of what this methodology can and cannot catch, and it should
+be the first thing a future reader takes from this file.
+
+Practical consequence: this eval has reached its resolution floor for the
+numerics family. The **fp32 TP all-reduce** test specced at the end of the bug
+#4 section (gaps 1+2, one contiguous patch in `moe_runner.py` — upcast at the
+combine point, keep fp32 through `tensor_model_parallel_all_reduce`, downcast
+once after) would be measured with this same instrument and would return this
+same non-answer. Do not run it unless a different readout appears. Recorded as
+specced-and-deliberately-not-run, not as untried.
+
+Standing claim: **indistinguishable from cloud at the limit of what we can
+measure, with the resolved-answer ratio matching to three figures.** That is a
+stronger statement than a pile of null p-values.
+
 ### Queue behind this
 1. **int8 KV** (`VLLM_DSV4_KV_INT8=1`, iSevenDays). The packed `fp8_ds_mla` row
    already carries a per-64-element UE8M0 power-of-two scale, which makes
@@ -133,9 +213,13 @@ Baselines to beat — **cloud scores the same 0.837 ± 0.016** (n=1963) with
    storage** — same 584 B/token, same KV pool, zero extra VRAM. Implemented as
    a second pass that overwrites only the 448 NoPE data bytes + 7 scale bytes
    after the stock C++ op, so no CUDA kernel replacement. This is the larger
-   lever and it attacks what the fp32 dot cannot. Run it *after* this
-   experiment resolves, not alongside — both are precision levers on the same
-   failure mode and simultaneous changes are unattributable.
+   lever and it attacks what the fp32 dot cannot. **UNBLOCKED 2026-08-02** — the
+   dot experiment resolved null, so nothing is competing for attribution now.
+   Note the caveat above before spending a run on it: int8 KV is a *precision*
+   lever, and precision levers are exactly what this eval has just been shown
+   unable to resolve. It is worth running only if it is expected to be
+   directional (a quantization-grid change can be, unlike rounding), and that
+   expectation should be stated before the run, not after.
 2. **dspark IMA discriminator.** Our crash is an illegal memory access at
    ~2k tokens. Two candidate causes, separable in one run: does it crash at a
    fixed *token position* (~2048, where the compressed candidate count hits
