@@ -231,6 +231,87 @@ stronger statement than a pile of null p-values.
    the checkpoint is DSpark-bound), which is a different failure and does not
    explain ours.
 
+## BUG #5 CANDIDATE (2026-08-02): greedy is nondeterministic above 2048 — bug #3's fix does not reach there
+
+**The determinism claim in the bug #3 section is true only below 2048 tokens of
+context.** Above it, greedy decoding is not reproducible, with
+`VLLM_DSV4_DETERMINISTIC_MOE=1` active and prefix caching off.
+
+### The measurement
+`scratchpad/det_probe.py` — `max_tokens=1` so only the forward pass is in play
+(no decode, no KV reuse, no sampling), `temperature=0`, `seed=0`, sequential
+single requests, same process. Compares the top-20 next-token logprobs across
+6 repeats of a byte-identical request. Text comparison is a *thresholded*
+readout — it only shows a difference once a perturbation flips an argmax — so
+the logprobs are the continuous signal underneath.
+
+| ctx | prompt tok | distinct logprob sets / 6 | max abs Δlogprob |
+|---|---|---|---|
+| 1900 | 1916 | 1 | 0 |
+| 1980 | 1996 | 1 | 0 |
+| 2015 | 2032 | 1 | 0 |
+| 2031 | **2048** | **1** | **0** |
+| 2047 | **2064** | **6** | **4.43 nats** |
+| 2063 | 2080 | 6 | 1.94 |
+| 2200 | 2217 | 6 | 1.83 |
+| 24000 | 24017 | 6 | 2.14 |
+
+Bit-identical at or below prompt 2048. Every repeat differs above it. Not a
+gradual onset — a step.
+
+### It is NOT chunked prefill (ruled out)
+`BATCHED_TOKENS=1024` makes prompt 2048 exactly two prefill chunks and 2064 the
+first length needing a third, so the chunking boundary and the indexer boundary
+coincide *exactly* at 2048. Re-ran the whole probe at `BATCHED_TOKENS=4096`,
+where everything through prompt 4096 is a single chunk:
+
+| ctx | prompt tok | batched=1024 | batched=4096 |
+|---|---|---|---|
+| 2031 | 2048 | bit-identical | bit-identical |
+| 2047 | 2064 | 6 sets | **6 sets** |
+| 3072 | 3089 | 6 sets | 6 sets (argmax flips) |
+
+The crossing does not move. The boundary is a property of the sequence, not of
+the batching — `index_topk=512` × ratio-4 = 2048 compressed candidates, the same
+boundary as bugs #1, #2 and the termination collapse. Fourth time.
+
+### Why this was not caught before, and it is the same trap as bug #2
+Bug #3 verified determinism on a **77-token** prompt (`76/77 prompt logprobs
+differ -> 0/77 bit-identical`). Below 2048 the indexer top-k is a no-op — every
+compressed candidate is selected regardless of score — so any residual
+ULP-scale nondeterminism is *absorbed* and cannot reach the output. The
+verification ran entirely inside the regime where the bug it would have caught
+is structurally invisible.
+
+That is the third instance in this project of a green test that could not fail:
+`pack_dsv4_reference_cache` (checker shared the layout assumption it checked),
+vLLM's `high` reasoning branch (tests asserted a no-op), and now this. The
+pattern to distrust: **a test whose passing regime excludes the failure mode.**
+
+### What this does and does not say
+- It does **not** make bug #3's fix useless. Below 2048 that fix is what makes
+  the run bit-identical; before it, even 77-token prompts varied by 3.7 nats.
+  The fix is necessary and incomplete, not wrong.
+- It does mean the 5.3% we pay for `DETERMINISTIC_MOE=1` **does not buy
+  reproducible greedy decoding at any realistic context length.** Re-decide
+  whether to keep paying it.
+- Whether the residual source also exists below 2048 (masked by the no-op) or
+  only exists above it is **unknown from output alone** — masking and absence
+  are indistinguishable at the API.
+- Magnitudes (1.6–4.4 nats max over top-20) are consistent with the bug #4
+  calibration: ~1 ULP amplified. This looks like a discrete *selection* flip
+  driven by a tiny score perturbation, not corruption.
+
+### Next step: the oracle already exists
+`VLLM_DSV4_TOPK_ORACLE` with `_DET=1` recomputes the logits and reports whether
+they are reproducible. That separates the two candidates directly:
+- logits bitwise reproducible but selection differs → **tie-breaking** in the
+  top-k is order-dependent;
+- logits differ → an upstream ULP-scale race that the selection amplifies.
+
+Needs `ENFORCE_EAGER=1`. Run it at ctx 2047+, which the probe shows is the
+cheapest length that reliably reproduces.
+
 ## What is different from the 4x box
 
 | | 4x box (CLAUDE.md) | this box |

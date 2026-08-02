@@ -51,6 +51,11 @@ fi
 # or NONE to take DSpark off the full-graph replay path.
 CUDAGRAPH_MODE=${CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}
 PREFIX_CACHING=${PREFIX_CACHING:-0}  # 0 = correctness baseline
+# Always pass --enable-prompt-tokens-details (below): without it vLLM reports
+# usage.prompt_tokens_details = null and `cached_tokens` is invisible, so there
+# is no way to tell a prefix-cache hit from a miss at the API. Pure telemetry,
+# no behaviour change. Essential for agentic harnesses, which re-send a growing
+# conversation every step and live or die on the hit rate.
 # ENFORCE_EAGER=1 turns off BOTH torch.compile and CUDA graphs. Diagnostic
 # only (it costs real throughput): nn.Module forward hooks do not fire inside
 # an inductor-compiled region, so any per-module tracing needs this.
@@ -156,6 +161,7 @@ exec ./venv/bin/vllm serve "$MODEL" \
   --gpu-memory-utilization "$UTIL" \
   --max-num-batched-tokens "$BATCHED_TOKENS" --max-num-seqs "$NUM_SEQS" \
   --no-scheduler-reserve-full-isl \
+  --enable-prompt-tokens-details \
   "${PARSERARGS[@]}" \
   $PREFIXARGS \
   "${SPECARGS[@]}" \
