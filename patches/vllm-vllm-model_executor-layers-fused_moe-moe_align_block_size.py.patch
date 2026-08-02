@@ -1,0 +1,89 @@
+diff --git a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+index 7fc8bfc..352cadf 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import os
+ 
+ import torch
+ 
+@@ -100,7 +102,76 @@
+     if expert_map is not None and not ignore_invalid_experts:
+         expert_ids = expert_map[expert_ids]
+ 
++    sorted_ids = _canonicalize_sorted_ids(
++        sorted_ids, expert_ids, block_size, topk_ids.numel()
++    )
++
+     return sorted_ids, expert_ids, num_tokens_post_pad
++
++
++# moet/sm89: the CUDA kernel assigns each token its slot within its expert via
++#   rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1)
++# (csrc/.../moe_align_sum_kernels.cu:318). atomicAdd returns the OLD value, so
++# a token's rank is decided by thread arrival order -- which is not
++# reproducible. Same inputs, different `sorted_token_ids` on every call:
++# measured 1/1 immediate repeats differ. Everything downstream of it is
++# deterministic (the Marlin GEMM 0/1500, _fused_marlin_moe 0/100, the TP
++# all-reduce 0/100), and yet the MoE block's output changes when only this
++# changes -- so a permutation here is not numerically free.
++#
++# Consequence at the top: greedy decoding was not reproducible. Same prompt,
++# temperature 0, prompt-logprob deltas up to ~3.7 nats, and a different first
++# token often enough to change the answer.
++#
++# The order within an expert carries no meaning -- it is a bucketing, and any
++# order computes the same set of (token, expert) pairs. So canonicalize it:
++# sort each expert's region by token id. Real ids are all < numel and padding
++# slots hold exactly numel, so ascending order keeps the reals packed at the
++# front of the region exactly as the kernel left them, only in a defined order.
++#
++# Off by default (VLLM_DSV4_DETERMINISTIC_MOE=1) because it is an argsort per
++# MoE layer per step that upstream does not pay.
++# "1" = ascending token id, "2" = descending. Both are canonical; the pair
++# exists as a control. If two different fixed orders give different logits,
++# then order is not numerically inert here -- which it should be, since the
++# bucketing is arbitrary -- and something downstream is order-sensitive.
++_DETERMINISTIC_MOE = os.environ.get("VLLM_DSV4_DETERMINISTIC_MOE", "0")
++
++
++def _canonicalize_sorted_ids(
++    sorted_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    block_size: int,
++    numel: int,
++) -> torch.Tensor:
++    if _DETERMINISTIC_MOE not in ("1", "2") or sorted_ids.numel() == 0:
++        return sorted_ids
++    n = sorted_ids.numel()
++    n_blocks = expert_ids.numel()
++    if n_blocks * block_size < n:
++        # fewer block slots than ids: geometry we do not understand, leave it
++        return sorted_ids
++    # Sort within each expert's RUN of blocks, not within each block: the
++    # nondeterministic rank decides a token's slot across the whole run, so a
++    # token moves between blocks of the same expert. Reordering inside a run is
++    # safe (every block in it uses the same expert weights, so each (token,
++    # expert) pairing is preserved); reordering across runs would not be.
++    #
++    # Run ids come from where `expert_ids` changes, so this holds whatever the
++    # layout is -- no assumption that experts appear once or in sorted order.
++    eids = expert_ids.to(torch.int64)
++    boundary = torch.ones_like(eids)
++    boundary[1:] = (eids[1:] != eids[:-1]).to(eids.dtype)
++    run_id = torch.cumsum(boundary, 0) - 1
++    # `max_num_tokens_padded` is not block-aligned in general, so the per-block
++    # run ids expand to slightly more slots than sorted_ids has -- truncate.
++    ids = sorted_ids.to(torch.int64)
++    if _DETERMINISTIC_MOE == "2":
++        # descending among the real ids, but padding (== numel) must stay at
++        # the back of the run or the GEMM would skip real rows.
++        ids = torch.where(ids < numel, numel - 1 - ids, ids)
++    key = run_id.repeat_interleave(block_size)[:n] * (numel + 1) + ids
++    return sorted_ids[torch.argsort(key, stable=True)]
+ 
+ 
+ def batched_moe_align_block_size(

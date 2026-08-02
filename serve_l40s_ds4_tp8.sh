@@ -42,6 +42,10 @@ CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,8,16,32}
 # or NONE to take DSpark off the full-graph replay path.
 CUDAGRAPH_MODE=${CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}
 PREFIX_CACHING=${PREFIX_CACHING:-0}  # 0 = correctness baseline
+# ENFORCE_EAGER=1 turns off BOTH torch.compile and CUDA graphs. Diagnostic
+# only (it costs real throughput): nn.Module forward hooks do not fire inside
+# an inductor-compiled region, so any per-module tracing needs this.
+ENFORCE_EAGER=${ENFORCE_EAGER:-0}
 # PARSERS=0 serves RAW: no reasoning/tool parsers, so `content` carries the
 # model's literal output including <think>...</think> instead of being split
 # into reasoning_content and tool_calls. Use when the eval harness does its own
@@ -68,6 +72,9 @@ if [ "${VLLM_MOE_W2:-0}" = "1" ]; then
   echo "refusing to start: VLLM_MOE_W2=1 is set; unset it (W2 mode has its own launcher)" >&2
   exit 1
 fi
+
+EAGERARGS=""
+[ "$ENFORCE_EAGER" = "1" ] && EAGERARGS="--enforce-eager"
 
 case "$SPEC" in
   none)   SPECARGS=() ;;
@@ -109,5 +116,6 @@ exec ./venv/bin/vllm serve "$MODEL" \
   "${PARSERARGS[@]}" \
   $PREFIXARGS \
   "${SPECARGS[@]}" \
+  ${EAGERARGS} \
   --compilation-config '{"cudagraph_mode":"'"$CUDAGRAPH_MODE"'","custom_ops":["all"],"cudagraph_capture_sizes":['"$CUDAGRAPH_SIZES"']}' \
   --port "$PORT"

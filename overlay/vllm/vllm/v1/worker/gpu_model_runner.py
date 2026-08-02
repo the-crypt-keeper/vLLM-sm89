@@ -251,6 +251,349 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+# ---------------------------------------------------------------------------
+# moet diagnostic: per-module FORWARD TRACE.
+#
+# Off unless VLLM_DSV4_FWD_TRACE names an output prefix. Registers a forward
+# hook on every named submodule and records a fingerprint of that module's
+# first tensor input and its output. Run the same request twice and diff the
+# traces in execution order: the first module whose INPUT fingerprint matches
+# across runs but whose OUTPUT fingerprint does not is the nondeterministic
+# one. Everything downstream of it differs for free and is not evidence.
+#
+#   VLLM_DSV4_FWD_TRACE        output prefix; unset/empty = off
+#   VLLM_DSV4_FWD_TRACE_FILTER substring filter on the module's dotted name
+#   VLLM_DSV4_FWD_TRACE_MAX    stop after this many hook firings (per rank)
+#
+# Requires --enforce-eager (ENFORCE_EAGER=1): nn.Module hooks do not fire
+# inside an inductor-compiled region, so without it the trace is silently
+# incomplete for exactly the code most likely to be at fault.
+_FWD_TRACE_PATH = os.environ.get("VLLM_DSV4_FWD_TRACE", "")
+_FWD_TRACE_FILTER = os.environ.get("VLLM_DSV4_FWD_TRACE_FILTER", "")
+_FWD_TRACE_MAX = int(os.environ.get("VLLM_DSV4_FWD_TRACE_MAX", "200000"))
+_fwd_trace_state: dict = {"n": 0, "fh": None, "on": False}
+
+
+def _fwd_fingerprint(x):
+    """Order-sensitive enough to catch a single flipped bit, cheap enough to
+    run on every module. A float64 sum alone can collide; sum + abs-sum +
+    absmax over the same tensor effectively cannot for real activations."""
+    if not isinstance(x, torch.Tensor) or x.numel() == 0:
+        return None
+    if x.dtype in (torch.bool, torch.int8, torch.uint8, torch.int32, torch.int64):
+        t = x.detach().to(torch.float64)
+    elif x.is_floating_point():
+        t = x.detach().to(torch.float64)
+    else:
+        return None
+    return {
+        "shape": list(x.shape),
+        "sum": float(t.sum()),
+        "abssum": float(t.abs().sum()),
+        "absmax": float(t.abs().max()),
+        "nan": int(torch.isnan(t).sum()),
+    }
+
+
+def _install_moe_double_check() -> None:
+    """VLLM_DSV4_MOE_DOUBLE=outer|inner: run the MoE expert computation twice
+    on byte-identical inputs and report whether it returns the same thing.
+
+    A per-module forward trace says WHICH module is nondeterministic; it cannot
+    say whether the module's own kernels are at fault or whether it was handed
+    something that changed. This can: same call, same arguments, back to back.
+    Three calls, not two, so an accumulating (rather than overwriting) output
+    buffer shows up as a growing delta instead of a false positive.
+    """
+    mode = os.environ.get("VLLM_DSV4_MOE_DOUBLE", "")
+    if mode not in ("outer", "inner", "both", "narrow"):
+        return
+    from vllm.model_executor.layers.fused_moe.experts import marlin_moe as _mm
+
+    def wrap(orig, label, out_arg=None):
+        stats: dict = {"n": 0, "diff": 0, "worst": 0.0, "worst23": 0.0}
+
+        def wrapped(*a, **kw):
+            # fused_marlin_moe writes into its `output=` kwarg and returns
+            # None, so the return value is not the thing to compare.
+            def grab(r):
+                v = kw.get(out_arg) if out_arg else r
+                if isinstance(v, (tuple, list)):
+                    # compare every tensor element, not just the first --
+                    # moe_align_block_size returns
+                    # (sorted_token_ids, expert_ids, num_tokens_post_padded)
+                    # and the interesting one is not element 0.
+                    return [t.clone() for t in v if isinstance(t, torch.Tensor)]
+                return v.clone() if isinstance(v, torch.Tensor) else None
+
+            def delta(x, y):
+                if x is None or y is None:
+                    return None
+                if isinstance(x, list):
+                    return max(
+                        (float((p.float() - q.float()).abs().max())
+                         for p, q in zip(x, y)),
+                        default=0.0,
+                    )
+                return float((x.float() - y.float()).abs().max())
+
+            r1 = orig(*a, **kw)
+            c1 = grab(r1)
+            r2 = orig(*a, **kw)
+            c2 = grab(r2)
+            r3 = orig(*a, **kw)
+            c3 = grab(r3)
+            stats["n"] += 1
+            if c1 is not None and c2 is not None and c3 is not None:
+                d12 = delta(c1, c2)
+                d23 = delta(c2, c3)
+                if d12 != 0.0:
+                    stats["diff"] += 1
+                    stats["worst"] = max(stats["worst"], d12)
+                    stats["worst23"] = max(stats["worst23"], d23)
+                if stats["n"] in (1, 10, 100) or stats["n"] % 500 == 0:
+                    logger.info(
+                        "DSv4 MoE double-check [%s]: %d/%d calls differed on a "
+                        "repeat with identical inputs; worst |d(1,2)|=%.3e "
+                        "worst |d(2,3)|=%.3e (comparable magnitudes => "
+                        "reduction order or stale reads, not accumulation)",
+                        label, stats["diff"], stats["n"],
+                        stats["worst"], stats["worst23"],
+                    )
+            else:
+                if stats["n"] == 1:
+                    logger.warning(
+                        "DSv4 MoE double-check [%s]: nothing comparable "
+                        "captured (returns %s, out_arg=%r)",
+                        label, type(r1).__name__, out_arg)
+            return r3
+
+        return wrapped
+
+    if mode in ("outer", "both"):
+        _mm.fused_marlin_moe = wrap(
+            _mm.fused_marlin_moe, "fused_marlin_moe", out_arg="output"
+        )
+    if mode == "narrow":
+        # between the block input and the GEMM: token/expert alignment, the
+        # activation quantization, and the final weighted sum.
+        _mm._fused_marlin_moe = wrap(_mm._fused_marlin_moe, "_fused_marlin_moe")
+        _mm.moe_align_block_size = wrap(
+            _mm.moe_align_block_size, "moe_align_block_size"
+        )
+        _mm.marlin_quant_input = wrap(_mm.marlin_quant_input, "marlin_quant_input")
+    if mode in ("inner", "both"):
+        from vllm import _custom_ops as _ops
+
+        _ops.moe_wna16_marlin_gemm = wrap(
+            _ops.moe_wna16_marlin_gemm, "moe_wna16_marlin_gemm"
+        )
+        _mm.ops.moe_wna16_marlin_gemm = _ops.moe_wna16_marlin_gemm
+    logger.info("DSv4 MoE double-check installed (mode=%s)", mode)
+
+
+def _install_module_double(model) -> None:
+    """VLLM_DSV4_DOUBLE_MODULE=<substring>: call the matching modules' forward
+    TWICE per invocation on the same inputs and report whether the two results
+    differ. Narrows "this module is nondeterministic across requests" down to
+    "this module is nondeterministic within a single forward", which separates
+    a racy kernel from state that changed between requests.
+
+    CAUTION: only safe for pure modules. Anything stateful will trip on the
+    second call -- e.g. SharedExperts asserts `self._output[idx] is None`, so
+    matching it (or any parent that calls it) raises. Point this at leaf
+    compute, and use the argument trace below for stateful paths.
+    """
+    pat = os.environ.get("VLLM_DSV4_DOUBLE_MODULE", "")
+    if not pat:
+        return
+    hit = []
+    for name, mod in model.named_modules():
+        if not name or pat not in name:
+            continue
+
+        def make(mod, name):
+            orig = mod.forward
+            stats = {"n": 0, "diff": 0, "worst": 0.0}
+
+            def fwd(*a, **kw):
+                r1 = orig(*a, **kw)
+                t1 = r1[0] if isinstance(r1, (tuple, list)) else r1
+                c1 = t1.clone() if isinstance(t1, torch.Tensor) else None
+                r2 = orig(*a, **kw)
+                t2 = r2[0] if isinstance(r2, (tuple, list)) else r2
+                stats["n"] += 1
+                if c1 is not None and isinstance(t2, torch.Tensor):
+                    d = float((c1 - t2).abs().max())
+                    if d != 0.0:
+                        stats["diff"] += 1
+                        stats["worst"] = max(stats["worst"], d)
+                    if stats["n"] in (1, 10, 100) or stats["n"] % 500 == 0:
+                        logger.info(
+                            "DSv4 module double-check [%s]: %d/%d immediate "
+                            "repeats differed, worst=%.3e",
+                            name, stats["diff"], stats["n"], stats["worst"],
+                        )
+                return r2
+
+            return fwd
+
+        mod.forward = make(mod, name)
+        hit.append(name)
+    logger.info(
+        "DSv4 module double-check installed on %d modules matching %r%s",
+        len(hit), pat, (": " + ", ".join(hit[:4])) if hit else "",
+    )
+
+
+def _install_moe_arg_trace() -> None:
+    """VLLM_DSV4_MOE_ARGTRACE=<path prefix>: fingerprint every tensor argument
+    and the result of the Marlin MoE GEMM, per call.
+
+    The double-check establishes the GEMM is deterministic given its inputs; a
+    forward trace establishes the MoE block's input is identical across
+    requests while its output is not. What is left is the code that turns the
+    block input into the GEMM arguments -- activation quantization, routing,
+    block alignment. Diff two requests' traces and the first call with a
+    differing ARGUMENT names the culprit directly.
+    """
+    path = os.environ.get("VLLM_DSV4_MOE_ARGTRACE", "")
+    if not path:
+        return
+    import json as _json
+
+    from vllm import _custom_ops as _ops
+    from vllm.model_executor.layers.fused_moe.experts import marlin_moe as _mm
+
+    try:
+        rank = torch.distributed.get_rank()
+    except Exception:
+        rank = os.getpid()
+    fh = open(f"{path}.rank{rank}.jsonl", "a", buffering=1)
+    # positional order of ops.moe_wna16_marlin_gemm
+    NAMES = [
+        "input", "output", "b_qweight", "b_bias", "b_scales", "a_scales",
+        "global_scale", "b_qzeros", "g_idx", "perm", "workspace",
+        "sorted_token_ids", "expert_ids", "num_tokens_past_padded",
+        "topk_weights",
+    ]
+    state = {"n": 0}
+    orig = _ops.moe_wna16_marlin_gemm
+
+    def wrapped(*a, **kw):
+        out = orig(*a, **kw)
+        rec = {"i": state["n"]}
+        for j, v in enumerate(a):
+            nm = NAMES[j] if j < len(NAMES) else f"arg{j}"
+            f = _fwd_fingerprint(v)
+            if f is not None:
+                rec[nm] = f
+        for k, v in kw.items():
+            f = _fwd_fingerprint(v)
+            if f is not None:
+                rec[k] = f
+        rec["RESULT"] = _fwd_fingerprint(out)
+        fh.write(_json.dumps(rec) + "\n")
+        state["n"] += 1
+        return out
+
+    _ops.moe_wna16_marlin_gemm = wrapped
+    _mm.ops.moe_wna16_marlin_gemm = wrapped
+    logger.info("DSv4 MoE ARG TRACE active -> %s.rank%s.jsonl", path, rank)
+
+
+def _install_allreduce_double() -> None:
+    """VLLM_DSV4_AR_DOUBLE=1: run the tensor-parallel all-reduce TWICE on the
+    same input and report whether the two results agree bitwise.
+
+    Safe across ranks: every rank runs the same wrapper, so the extra
+    collective is symmetric. NCCL is only bit-reproducible if it picks the same
+    algorithm/protocol AND the same reduction order every time; nothing
+    guarantees that run to run, and an 8-way bf16 sum is exactly where a
+    different order shows up in the low bits.
+    """
+    if os.environ.get("VLLM_DSV4_AR_DOUBLE", "") != "1":
+        return
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
+
+    orig = _mr.tensor_model_parallel_all_reduce
+    stats = {"n": 0, "diff": 0, "worst": 0.0}
+
+    def wrapped(x, *a, **kw):
+        r1 = orig(x.clone(), *a, **kw)
+        c1 = r1.clone()
+        r2 = orig(x.clone(), *a, **kw)
+        stats["n"] += 1
+        d = float((c1 - r2).abs().max())
+        if d != 0.0:
+            stats["diff"] += 1
+            stats["worst"] = max(stats["worst"], d)
+        if stats["n"] in (1, 10, 100) or stats["n"] % 500 == 0:
+            logger.info(
+                "DSv4 all-reduce double-check: %d/%d repeats differed on "
+                "identical input, worst=%.3e",
+                stats["diff"], stats["n"], stats["worst"],
+            )
+        return r2
+
+    _mr.tensor_model_parallel_all_reduce = wrapped
+    logger.info("DSv4 all-reduce double-check installed")
+
+
+def _install_forward_trace(model) -> None:
+    if not _FWD_TRACE_PATH or _fwd_trace_state["on"]:
+        return
+    import json as _json
+
+    try:
+        rank = torch.distributed.get_rank()
+    except Exception:
+        rank = os.getpid()
+    path = f"{_FWD_TRACE_PATH}.rank{rank}.jsonl"
+    fh = open(path, "a", buffering=1)
+    _fwd_trace_state["fh"] = fh
+    _fwd_trace_state["on"] = True
+
+    def make_hook(name):
+        def hook(mod, args, out):
+            if _fwd_trace_state["n"] >= _FWD_TRACE_MAX:
+                return
+            first_in = next(
+                (a for a in args if isinstance(a, torch.Tensor)), None
+            )
+            first_out = out
+            if isinstance(out, (tuple, list)):
+                first_out = next(
+                    (o for o in out if isinstance(o, torch.Tensor)), None
+                )
+            rec = {
+                "i": _fwd_trace_state["n"],
+                "mod": name,
+                "cls": type(mod).__name__,
+                "in": _fwd_fingerprint(first_in),
+                "out": _fwd_fingerprint(first_out),
+            }
+            fh.write(_json.dumps(rec) + "\n")
+            _fwd_trace_state["n"] += 1
+
+        return hook
+
+    n = 0
+    for name, mod in model.named_modules():
+        if not name:
+            continue
+        if _FWD_TRACE_FILTER and _FWD_TRACE_FILTER not in name:
+            continue
+        mod.register_forward_hook(make_hook(name))
+        n += 1
+    logger.info(
+        "DSv4 FORWARD TRACE active -> %s (%d modules hooked, filter=%r)",
+        path,
+        n,
+        _FWD_TRACE_FILTER or "*",
+    )
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -6080,6 +6423,11 @@ class GPUModelRunner(
             format_gib(self.model_memory_usage),
             time_after_load - time_before_load,
         )
+        _install_forward_trace(self.model)
+        _install_moe_double_check()
+        _install_module_double(self.model)
+        _install_moe_arg_trace()
+        _install_allreduce_double()
         # moe_w2 pool-floor guard: refuse to serve a base-cache pool sized
         # below its per-step working set (silent quality corruption:
         # routed experts keep zeroed contributions). Runs here because the
