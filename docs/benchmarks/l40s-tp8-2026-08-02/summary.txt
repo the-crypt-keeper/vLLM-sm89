@@ -1,0 +1,54 @@
+=== decode_c1 : in=1024 out=2048 conc=1 prompts=4 ===
+Successful requests:                     4         
+Benchmark duration (s):                  149.97    
+Output token throughput (tok/s):         54.63     
+Median TTFT (ms):                        323.92    
+Median TPOT (ms):                        18.15     
+=== decode_c2 : in=1024 out=2048 conc=2 prompts=8 ===
+Successful requests:                     8         
+Benchmark duration (s):                  155.11    
+Output token throughput (tok/s):         105.62    
+Median TTFT (ms):                        498.19    
+Median TPOT (ms):                        18.70     
+=== decode_c4 : in=1024 out=2048 conc=4 prompts=12 ===
+Successful requests:                     12        
+Benchmark duration (s):                  130.30    
+Output token throughput (tok/s):         188.61    
+Median TTFT (ms):                        1059.51   
+Median TPOT (ms):                        20.69     
+=== decode_c16 : in=1024 out=2048 conc=16 prompts=32 ===
+Successful requests:                     32        
+Benchmark duration (s):                  126.67    
+Output token throughput (tok/s):         517.36    
+Median TTFT (ms):                        1231.66   
+Median TPOT (ms):                        30.10     
+=== decode_c64 : in=1024 out=2048 conc=64 prompts=128 ===
+Successful requests:                     128       
+Benchmark duration (s):                  245.65    
+Output token throughput (tok/s):         1067.15   
+Median TTFT (ms):                        1582.08   
+Median TPOT (ms):                        58.52     
+=== decode_c128 : in=1024 out=2048 conc=128 prompts=256 ===
+Successful requests:                     256       
+Benchmark duration (s):                  349.44    
+Output token throughput (tok/s):         1500.35   
+Median TTFT (ms):                        3017.12   
+Median TPOT (ms):                        82.64     
+=== prefill_c1 : in=8192 out=4096 conc=1 prompts=3 ===
+Successful requests:                     3         
+Benchmark duration (s):                  242.38    
+Output token throughput (tok/s):         50.70     
+Median TTFT (ms):                        2340.91   
+Median TPOT (ms):                        19.15     
+=== prefill_c2 : in=8192 out=4096 conc=2 prompts=6 ===
+Successful requests:                     6         
+Benchmark duration (s):                  255.13    
+Output token throughput (tok/s):         96.33     
+Median TTFT (ms):                        3166.16   
+Median TPOT (ms):                        19.99     
+=== prefill_c4 : in=8192 out=4096 conc=4 prompts=12 ===
+Successful requests:                     12        
+Benchmark duration (s):                  291.03    
+Output token throughput (tok/s):         168.89    
+Median TTFT (ms):                        3825.45   
+Median TPOT (ms):                        22.75     

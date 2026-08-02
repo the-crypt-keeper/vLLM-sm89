@@ -10,7 +10,41 @@ The distinguishing claim is not that it runs. It is that the output has been
 indistinguishable** — after four correctness bugs that were invisible to every
 self-test in the stack were found and fixed.
 
-<!-- BENCH_TABLE -->
+## Benchmarks
+
+8x L40S TP8, `DeepSeek-V4-Flash-0731`, 16K context, fp8 KV, MXFP4 experts
+via Marlin, **no speculative decoding**, prefix caching off, and
+`VLLM_DSV4_DETERMINISTIC_MOE=1` — i.e. the ~5.3% determinism cost is *included*,
+not benchmarked around. `vllm bench serve`, random dataset, `--ignore-eos`,
+measured 2026-08-02. Every run completed with zero failures.
+
+**Decode** — 1K in / 2K out:
+
+| concurrency | output tok/s | per stream | median TTFT | median TPOT |
+|---:|---:|---:|---:|---:|
+| 1 | **54.6** | 54.6 | 324 ms | 18.2 ms |
+| 2 | **105.6** | 52.8 | 498 ms | 18.7 ms |
+| 4 | **188.6** | 47.2 | 1,060 ms | 20.7 ms |
+| 16 | **517.4** | 32.3 | 1,232 ms | 30.1 ms |
+| 64 | **1,067.1** | 16.7 | 1,582 ms | 58.5 ms |
+| 128 | **1,500.3** | 11.7 | 3,017 ms | 82.6 ms |
+
+**Prefill** — 8K in / 4K out:
+
+| concurrency | prefill tok/s | total tok/s | output tok/s | median TTFT |
+|---:|---:|---:|---:|---:|
+| 1 | **3,499** | 152.1 | 50.7 | 2,341 ms |
+| 2 | **5,175** | 289.0 | 96.3 | 3,166 ms |
+| 4 | **8,566** | 506.7 | 168.9 | 3,825 ms |
+
+Decode scales close to linearly to 4 streams (54.6 → 188.6 tok/s) and keeps
+climbing to **1,500 tok/s at 128 concurrent** — 27x the single-stream rate.
+Prefill is `concurrency x 8192 / median TTFT`; single-stream **3.5K tok/s**,
+**8.6K tok/s** at 4 concurrent. Decode here is bandwidth-bound: L40S is GDDR6
+at 864 GB/s, and TP8 aggregate bandwidth is what carries the batch.
+
+Raw `vllm bench serve` JSON and the sweep script are committed under
+[`docs/benchmarks/l40s-tp8-2026-08-02/`](docs/benchmarks/l40s-tp8-2026-08-02/).
 
 ---
 
