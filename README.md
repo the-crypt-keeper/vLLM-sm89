@@ -1,8 +1,9 @@
 # DeepSeek-V4-Flash on Ada (sm89) — validated, not just running
 
-This fork serves **DeepSeek-V4-Flash (304B total, ~12.7B activated)** on
-**NVIDIA L40S / Ada (sm_89)**
-using the checkpoint's **stock MXFP4 experts through Marlin** — no exotic
+This fork serves
+**[deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)**
+— the GA checkpoint, 304B total / ~12.7B activated — on **NVIDIA L40S / Ada
+(sm_89)** using its **stock MXFP4 experts through Marlin**: no exotic
 quantization, no 2-bit codebooks, no hand-written SASS. Base is official vLLM
 **v0.25.1** at commit `752a3a504` plus generated per-file patches from `patches/`.
 
@@ -13,7 +14,7 @@ self-test in the stack were found and fixed.
 
 ## Benchmarks
 
-8x L40S TP8, `DeepSeek-V4-Flash-0731`, 16K context, fp8 KV, MXFP4 experts
+8x L40S TP8, [`DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731), 16K context, fp8 KV, MXFP4 experts
 via Marlin, **no speculative decoding**, prefix caching off, and
 `VLLM_DSV4_DETERMINISTIC_MOE=1` — i.e. the ~5.3% determinism cost is *included*,
 not benchmarked around. `vllm bench serve`, random dataset, `--ignore-eos`,
