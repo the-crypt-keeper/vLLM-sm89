@@ -1,0 +1,406 @@
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index 867f71b..0fed08a 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Fused MoE utilities for GPTQ."""
+ 
++import json
++import os
+ from collections.abc import Callable
+ 
+ import torch
+@@ -49,8 +51,222 @@
+     kMxfp8Static,
+     kNvfp4Static,
+ )
++from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.scalar_type import ScalarType, scalar_types
++
++logger = init_logger(__name__)
++
++# ---------------------------------------------------------------------------
++# Bug #4 instrumentation: order sensitivity in the Marlin MoE path.
++#
++# DeepSeek's reference MoE (inference/model.py, DeepseekV4 `MoE.forward`) has no
++# bucketing at all -- it does `y[idx] += expert(x[idx], ...)` over the rows
++# routed to each expert, so the result provably cannot depend on the order the
++# rows are visited in.  vLLM's Marlin path buckets rows into `block_size_m`
++# blocks via moe_align_block_size(), and a controlled A/B of two FIXED canonical
++# orderings (ascending vs descending token id within each expert run, see
++# VLLM_DSV4_DETERMINISTIC_MOE in moe_align_block_size.py) showed 76/77 prompt
++# logprobs differing, median 0.092 / max 1.62 nats.  Each order is individually
++# reproducible, so this is not a race -- the permutation itself is changing the
++# arithmetic.  That should be impossible, hence: instrument.
++#
++# ANSWER (measured 2026-08-02, TP8 sm89, VLLM_DSV4_MARLIN_ORDER_CHECK=3):
++#   Not a memory-safety bug.  Marlin schedules its tiles as "DP + two-tile
++#   stream-K" (marlin_template.h, `part1_mn_iters` / `part2_mn_tiles`, see
++#   vllm-project/vllm#24722).  `slice_count` -- how many threadblocks split the
++#   k-reduction for a tile, and therefore how the fp32 partial sums are GROUPED
++#   before the bf16 store -- is derived from `slice_col_par`, the global tile
++#   index, which is `moe_block_index * n_tiles + n_tile`.  So the accumulation
++#   grouping is a function of WHICH BLOCK a row lands in.  Two orderings that
++#   move a row between blocks of the same expert hand it a different, equally
++#   valid summation grouping, and it rounds differently.
++#
++#   The evidence, over 172 calls per rank at M in {16, 32, 78, 1024}:
++#     - asc-vs-asc control: 0 differing rows, every call, both GEMMs.  No race.
++#     - asc-vs-desc: differing rows are ALWAYS a subset of the rows that changed
++#       block.  `diff_not_moved == 0` in every single call.  A row that only
++#       changed lane within its block never changed value.
++#     - every difference is <= 1 bf16 ULP (max 7.8e-03 on values of that scale).
++#     - M=16 has one block per expert, so nothing moves and nothing differs.
++#
++#   And the amplification is real, not suspicious: VLLM_DSV4_MOE_ULP_JITTER=6
++#   (flip the low mantissa bit of every 6th expert-output row, for reasons
++#   unrelated to ordering) moves the 77 prompt logprobs by median 0.0935 /
++#   max 2.11 nats -- statistically indistinguishable from what reordering does
++#   (median 0.0920 / max 1.62).  43 layers plus the indexer's discrete top-512
++#   selection turn one ULP into tenths of a nat.
++#
++#   Consequence: the ordering CANNOT be made inert without changing marlin's
++#   schedule.  VLLM_DSV4_DETERMINISTIC_MOE is therefore the fix, not a
++#   workaround -- moe_align_block_size's atomicAdd rank leaks into the numerics
++#   whenever an expert holds more tokens than one block, and pinning the order
++#   is the only way to close that.  Keep the `=1` vs `=2` A/B as a regression
++#   gate: it must keep showing differences confined to moved rows and bounded
++#   by one ULP.
++#
++# VLLM_DSV4_MARLIN_TRACE=<path>  -- append per-call stage fingerprints as JSONL.
++#   Fingerprints are taken at every stage boundary inside _fused_marlin_moe so
++#   the first stage whose output differs between two orderings localizes the
++#   defect: gemm1 -> activation -> gemm2 -> moe_sum.  All of these are indexed
++#   by flat (token, topk) pair id, NOT by slot position, so every one of them
++#   must be bit-identical across orderings.
++# VLLM_DSV4_MARLIN_TRACE_MAX=<n>  -- stop after n calls (default 64).
++# VLLM_DSV4_MARLIN_POISON=<v>  -- prefill the intermediate caches with this
++#   value (e.g. "nan") instead of leaving torch.empty() garbage in them.  The
++#   caches are aliased (intermediate_cache1 and intermediate_cache3 are both
++#   views of intermediate_cache13) and never zeroed unless expert_map is set,
++#   so any row the kernels fail to write is read back as whatever the previous
++#   call left there.  If poisoning changes the output, some row is being
++#   consumed that was never written -- the same defect class as bugs #1 and #2.
++# ---------------------------------------------------------------------------
++_MARLIN_TRACE = os.environ.get("VLLM_DSV4_MARLIN_TRACE", "")
++_MARLIN_TRACE_MAX = int(os.environ.get("VLLM_DSV4_MARLIN_TRACE_MAX", "64"))
++_MARLIN_POISON = os.environ.get("VLLM_DSV4_MARLIN_POISON", "")
++# VLLM_DSV4_MARLIN_ORDER_CHECK=1 -- run each GEMM a second time with the rows
++#   of every expert run reversed, and diff.  Both orderings are legal outputs
++#   of moe_align_block_size(), so any difference is the bug.  Both destination
++#   buffers are seeded identically first (zeros, or the poison value) so an
++#   uninitialized-read cannot masquerade as an ordering effect.
++_MARLIN_ORDER_CHECK = os.environ.get("VLLM_DSV4_MARLIN_ORDER_CHECK", "0")
++# VLLM_DSV4_MOE_ULP_JITTER=<n> -- after GEMM1, flip the lowest mantissa bit of
++#   every n-th row of intermediate_cache1.  That is exactly the perturbation
++#   the order-check measured (<=1 ULP, on a minority of rows), applied
++#   deterministically and for a reason unrelated to ordering.  Comparing the
++#   engine's output with and without it calibrates how far a 1-ULP expert-output
++#   perturbation travels through 43 layers -- i.e. whether the ordering effect
++#   is sufficient to explain the observed end-to-end logprob divergence.
++_MOE_ULP_JITTER = int(os.environ.get("VLLM_DSV4_MOE_ULP_JITTER", "0"))
++_MARLIN_CALLS = 0
++
++
++def _marlin_fp(t: torch.Tensor | None) -> dict | None:
++    """Order-insensitive value fingerprint of a tensor (float64 accumulation)."""
++    if t is None:
++        return None
++    f = t.detach().reshape(-1)
++    if f.dtype in (torch.int32, torch.int64, torch.int16, torch.uint8):
++        f = f.to(torch.float64)
++        return {
++            "shape": list(t.shape),
++            "sum": float(f.sum()),
++            "min": float(f.min()) if f.numel() else 0.0,
++            "max": float(f.max()) if f.numel() else 0.0,
++        }
++    f = f.to(torch.float64)
++    finite = torch.isfinite(f)
++    g = f[finite]
++    return {
++        "shape": list(t.shape),
++        "sum": float(g.sum()) if g.numel() else 0.0,
++        "abssum": float(g.abs().sum()) if g.numel() else 0.0,
++        "absmax": float(g.abs().max()) if g.numel() else 0.0,
++        "n_nonfinite": int((~finite).sum()),
++    }
++
++
++def _marlin_order_variants(
++    sorted_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    block_size: int,
++    numel: int,
++    control: bool = False,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
++    """Two canonical orderings of `sorted_ids` that must be numerically equal.
++
++    Both keep every token in the same expert RUN (the contiguous span of blocks
++    carrying one expert id) -- only the position of a token inside its run
++    changes, ascending token id vs descending.  moe_align_block_size() itself
++    picks an arbitrary one of these via an atomicAdd rank, so the kernel must
++    treat all of them identically or the engine is nondeterministic.
++
++    Returns (ascending, descending, run_id_per_slot) or None if the geometry
++    is not the expected block-padded one.
++    """
++    n = sorted_ids.numel()
++    n_blocks = expert_ids.numel()
++    if n == 0 or n_blocks * block_size < n:
++        return None
++    eids = expert_ids.to(torch.int64)
++    boundary = torch.ones_like(eids)
++    boundary[1:] = (eids[1:] != eids[:-1]).to(eids.dtype)
++    run_id = (torch.cumsum(boundary, 0) - 1).repeat_interleave(block_size)[:n]
++    ids = sorted_ids.to(torch.int64)
++    stride = numel + 1
++    asc = sorted_ids[torch.argsort(run_id * stride + ids, stable=True)]
++    rev = torch.where(ids < numel, numel - 1 - ids, ids)
++    desc = sorted_ids[torch.argsort(run_id * stride + rev, stable=True)]
++    if control:
++        # Control: compare the ascending order against ITSELF.  Any difference
++        # here is a race inside the kernel, not an ordering effect.
++        desc = asc.clone()
++
++    # Which rows changed BLOCK (not merely lane)?  A block is `block_size`
++    # consecutive slots; the k-split schedule is keyed on block index, so a row
++    # that moves between blocks of the same expert can legitimately pick up a
++    # different fp32 accumulation grouping, while a row that only changes lane
++    # within its block cannot.  This separates "non-associative reduction" from
++    # "reads something it should not".
++    slot_block = (
++        torch.arange(n, device=sorted_ids.device, dtype=torch.int64) // block_size
++    )
++    blk_a = torch.full((numel,), -1, device=sorted_ids.device, dtype=torch.int64)
++    blk_d = torch.full((numel,), -1, device=sorted_ids.device, dtype=torch.int64)
++    ia, id_ = asc.to(torch.int64), desc.to(torch.int64)
++    va, vd = ia < numel, id_ < numel
++    blk_a[ia[va]] = slot_block[va]
++    blk_d[id_[vd]] = slot_block[vd]
++    moved = blk_a != blk_d
++    return asc, desc, moved
++
++
++def _marlin_rowdiff(
++    a: torch.Tensor, b: torch.Tensor, moved: torch.Tensor | None = None
++) -> dict:
++    """Row-level difference between two (rows, cols) results.
++
++    `moved` marks rows that changed BLOCK between the two orderings.  If every
++    differing row is a moved row, the effect is non-associative fp32 reduction
++    across a different k-split grouping -- unpleasant but not memory unsafety.
++    A differing row that did NOT move is a real defect.
++    """
++    d = (a.to(torch.float64) - b.to(torch.float64)).abs()
++    nan_only = torch.isnan(a) ^ torch.isnan(b)
++    row_bad = (d > 0).any(dim=1) | nan_only.any(dim=1)
++    idx = row_bad.nonzero(as_tuple=True)[0]
++    finite = d[torch.isfinite(d)]
++    out = {
++        "rows": int(a.size(0)),
++        "rows_diff": int(row_bad.sum()),
++        "max_abs": float(finite.max()) if finite.numel() else 0.0,
++        "first_rows": idx[:16].tolist(),
++    }
++    if moved is not None and moved.numel() == a.size(0):
++        out["rows_moved"] = int(moved.sum())
++        out["diff_and_moved"] = int((row_bad & moved).sum())
++        out["diff_not_moved"] = int((row_bad & ~moved).sum())
++        stuck = (row_bad & ~moved).nonzero(as_tuple=True)[0]
++        out["stuck_rows"] = stuck[:16].tolist()
++    return out
++
++
++def _marlin_poison_value() -> float:
++    if not _MARLIN_POISON:
++        return 0.0
++    return float("nan") if _MARLIN_POISON.lower() == "nan" else float(_MARLIN_POISON)
++
++
++def _marlin_poison_(t: torch.Tensor) -> torch.Tensor:
++    if not _MARLIN_POISON:
++        return t
++    t.fill_(_marlin_poison_value())
++    return t
++
++
++def _marlin_seed_(t: torch.Tensor) -> torch.Tensor:
++    """Put a known, identical value in a GEMM destination before both runs."""
++    t.fill_(_marlin_poison_value())
++    return t
+ 
+ 
+ def _fused_marlin_moe(
+@@ -121,6 +337,47 @@
+ 
+     intermediate_cache2 = _resize_cache(intermediate_cache2, (M * num_topk, N))
+ 
++    global _MARLIN_CALLS
++    _trace: dict | None = None
++    _order_desc: torch.Tensor | None = None
++    _order_moved: torch.Tensor | None = None
++    _ctrl = False
++    if _MARLIN_ORDER_CHECK in ("1", "2", "3") and _MARLIN_CALLS < _MARLIN_TRACE_MAX:
++        # mode 3 alternates: even calls test asc-vs-desc, odd calls are the
++        # asc-vs-asc control, so one boot answers both questions.
++        _ctrl = _MARLIN_ORDER_CHECK == "2" or (
++            _MARLIN_ORDER_CHECK == "3" and _MARLIN_CALLS % 2 == 1
++        )
++        _v = _marlin_order_variants(
++            sorted_token_ids, expert_ids, block_size_m, M * num_topk, _ctrl
++        )
++        if _v is not None:
++            # Drive the real path with the ascending order so the comparison is
++            # against a fixed, reproducible baseline rather than whatever the
++            # atomicAdd handed us this call.
++            sorted_token_ids, _order_desc, _order_moved = _v
++            _marlin_seed_(intermediate_cache1)
++    if _MARLIN_POISON:
++        _marlin_poison_(intermediate_cache13)
++        _marlin_poison_(intermediate_cache2)
++    if _MARLIN_TRACE and _MARLIN_CALLS < _MARLIN_TRACE_MAX:
++        _trace = {
++            "call": _MARLIN_CALLS,
++            "M": M,
++            "N": N,
++            "K": K,
++            "topk": num_topk,
++            "block_size_m": block_size_m,
++            "in_hidden": _marlin_fp(hidden_states),
++            "in_topk_weights": _marlin_fp(topk_weights),
++            "in_sorted_ids": _marlin_fp(sorted_token_ids),
++            "in_expert_ids": _marlin_fp(expert_ids),
++            "in_npp": int(num_tokens_post_padded[0]),
++            "out_provided": output is not None,
++            "ctrl": bool(_order_desc is not None and _ctrl),
++        }
++    _MARLIN_CALLS += 1
++
+     a_scales1 = None
+     gate_up_input = hidden_states
+     if input_dtype == torch.int8:
+@@ -158,6 +415,51 @@
+         use_fp32_reduce=True,
+         is_zp_float=False,
+     )
++    if _MOE_ULP_JITTER and intermediate_cache1.dtype == torch.bfloat16:
++        _rows = intermediate_cache1[:: _MOE_ULP_JITTER]
++        _rows.view(torch.int16).bitwise_xor_(1)
++
++    if _trace is not None:
++        _trace["s1_gemm1"] = _marlin_fp(intermediate_cache1)
++    if _order_desc is not None:
++        _alt1 = _marlin_seed_(torch.empty_like(intermediate_cache1))
++        ops.moe_wna16_marlin_gemm(
++            gate_up_input,
++            _alt1,
++            w1,
++            bias1,
++            w1_scale,
++            a_scales1,
++            global_scale1,
++            w1_zeros,
++            g_idx1,
++            sort_indices1,
++            workspace,
++            _order_desc,
++            expert_ids,
++            num_tokens_post_padded,
++            topk_weights,
++            moe_block_size=block_size_m,
++            top_k=num_topk,
++            mul_topk_weights=apply_router_weight_on_input,
++            b_q_type=quant_type,
++            size_m=M,
++            size_n=w13_num_shards * N,
++            size_k=K,
++            is_k_full=is_k_full,
++            use_atomic_add=False,
++            use_fp32_reduce=True,
++            is_zp_float=False,
++        )
++        _od = _marlin_rowdiff(intermediate_cache1, _alt1, _order_moved)
++        if _trace is not None:
++            _trace["order_gemm1"] = _od
++        if _od["rows_diff"]:
++            logger.warning(
++                "marlin order-check: GEMM1 differs under a row permutation "
++                "that must be inert -- %s", _od
++            )
++        del _alt1
+     # apply_moe_activation fuses the clamp/gate params: SILU + clamp_limit and
+     # SWIGLUOAI_UNINTERLEAVE both map to the silu_and_mul_with_clamp kernel.
+     activation_func(
+@@ -169,11 +471,17 @@
+         beta=gemm1_beta,
+     )
+ 
++    if _trace is not None:
++        _trace["s2_act"] = _marlin_fp(intermediate_cache2)
++
+     if output is None:
+         output = intermediate_cache3
+ 
+     if expert_map is not None:
+         output.zero_()
++
++    if _order_desc is not None:
++        _marlin_seed_(output)
+ 
+     a_scales2 = None
+     if input_dtype == torch.int8:
+@@ -215,6 +523,51 @@
+         use_fp32_reduce=True,
+         is_zp_float=False,
+     )
++
++    if _trace is not None:
++        _trace["s3_gemm2"] = _marlin_fp(output)
++    if _order_desc is not None:
++        _alt3 = _marlin_seed_(torch.empty_like(output))
++        ops.moe_wna16_marlin_gemm(
++            intermediate_cache2,
++            _alt3,
++            w2,
++            bias2,
++            w2_scale,
++            a_scales2,
++            global_scale2,
++            w2_zeros,
++            g_idx2,
++            sort_indices2,
++            workspace,
++            _order_desc,
++            expert_ids,
++            num_tokens_post_padded,
++            topk_weights,
++            moe_block_size=block_size_m,
++            top_k=1,
++            mul_topk_weights=not apply_router_weight_on_input,
++            b_q_type=quant_type,
++            size_m=M * num_topk,
++            size_n=K,
++            size_k=N,
++            is_k_full=is_k_full,
++            use_atomic_add=False,
++            use_fp32_reduce=True,
++            is_zp_float=False,
++        )
++        _od = _marlin_rowdiff(output, _alt3, _order_moved)
++        if _trace is not None:
++            _trace["order_gemm2"] = _od
++        if _od["rows_diff"]:
++            logger.warning(
++                "marlin order-check: GEMM2 differs under a row permutation "
++                "that must be inert -- %s", _od
++            )
++        del _alt3
++    if _trace is not None:
++        with open(f"{_MARLIN_TRACE}.{os.getpid()}", "a") as _f:
++            _f.write(json.dumps(_trace) + "\n")
+ 
+     return output
+ 

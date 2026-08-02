@@ -14,6 +14,7 @@ vllm-vllm-config-speculative.py.patch
 vllm-vllm-config-vllm.py.patch
 vllm-vllm-envs.py.patch
 vllm-vllm-model_executor-layers-attention-mla_attention.py.patch
+vllm-vllm-model_executor-layers-fused_moe-experts-marlin_moe.py.patch
 vllm-vllm-model_executor-layers-fused_moe-moe_align_block_size.py.patch
 vllm-vllm-model_executor-layers-quantization-fp8.py.patch
 vllm-vllm-model_executor-layers-quantization-modelopt.py.patch
