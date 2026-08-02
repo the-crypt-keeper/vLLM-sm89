@@ -83,6 +83,23 @@ _LOG2E = 1.4426950408889634
 # time, so a consistent snapshot here is correct by construction.
 _IS_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
 
+# VLLM_DSV4_MLA_DOT_FP32=1 runs the sparse-MLA attention dots in fp32 (tf32
+# tensor cores, ~11 mantissa bits) instead of bf16 (~8). The init-time
+# self-test reports the bf16 path at worst_row_rel ~7.6e-03 PER LAYER, which
+# compounds across 43 layers, and this model amplifies small numerical
+# perturbations hard -- 1 bf16 ULP in an expert output moves prompt logprobs
+# by ~0.09 nats median (see the bug #4 write-up). iSevenDays measured 16K
+# needle 0.948 -> 0.966 from this change on the IQ2 expert path
+# (iSevenDays/vLLM-Moet@b158280); the attention-dot precision is orthogonal to
+# expert quantization, so the direction should carry to the Marlin path even
+# if the magnitude does not.
+#
+# NOT FREE: fp32 operand tiles do not fit Ada's 99 KiB smem at BLOCK_N=32
+# (measured 295 KiB via AOT compile), so this also halves BLOCK_N to 16 --
+# twice as many N-loop iterations on top of the slower arithmetic. Measure
+# throughput, not just quality.
+_MLA_DOT_FP32 = os.getenv("VLLM_DSV4_MLA_DOT_FP32", "0") == "1"
+
 
 @functools.cache
 def _module_build_id() -> str:
@@ -242,7 +259,8 @@ def _sparse_mla_dsv4_kernel(
             k = k.to(tl.bfloat16)
             s = tl.dot(q, tl.trans(k)) * qk_scale
         else:
-            s = tl.dot(q.to(tl.float32), tl.trans(k)) * qk_scale
+            s = tl.dot(q.to(tl.float32), tl.trans(k),
+                       allow_tf32=True) * qk_scale
         s = tl.where(valid[None, :], s, -1.0e30)
         m_new = tl.maximum(m, tl.max(s, axis=1))
         alpha = tl.exp2(m - m_new)
@@ -251,7 +269,7 @@ def _sparse_mla_dsv4_kernel(
         if DOT_BF16:
             acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), k)
         else:
-            acc = acc * alpha[:, None] + tl.dot(p, k)
+            acc = acc * alpha[:, None] + tl.dot(p, k, allow_tf32=True)
         m = m_new
 
     if HAS_EXTRA:
@@ -275,7 +293,8 @@ def _sparse_mla_dsv4_kernel(
                 k = k.to(tl.bfloat16)
                 s = tl.dot(q, tl.trans(k)) * qk_scale
             else:
-                s = tl.dot(q.to(tl.float32), tl.trans(k)) * qk_scale
+                s = tl.dot(q.to(tl.float32), tl.trans(k),
+                           allow_tf32=True) * qk_scale
             s = tl.where(valid[None, :], s, -1.0e30)
             m_new = tl.maximum(m, tl.max(s, axis=1))
             alpha = tl.exp2(m - m_new)
@@ -284,7 +303,7 @@ def _sparse_mla_dsv4_kernel(
             if DOT_BF16:
                 acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), k)
             else:
-                acc = acc * alpha[:, None] + tl.dot(p, k)
+                acc = acc * alpha[:, None] + tl.dot(p, k, allow_tf32=True)
             m = m_new
 
     if HAS_SINK:
@@ -598,16 +617,18 @@ def triton_sparse_mla_dsv4(
             IS_PACKED=packed_main,
             EXTRA_IS_PACKED=packed_extra,
             BLOCK_H=block_h,
-            BLOCK_N=32,
+            # f32 operand tiles measured 295 KiB via AOT compile, over Ada's
+            # 99 KiB smem at BLOCK_N=32 -- the fp32 dot path only fits at 16.
+            BLOCK_N=16 if _MLA_DOT_FP32 else 32,
             D=_D,
             D_NOPE=_D_NOPE,
             QUANT_TILE=_QUANT_TILE,
-            # The Triton interpreter (numpy) cannot emulate bf16 dots; the
-            # GPU build MUST use bf16 operands to fit Ada's 99 KiB smem
-            # (f32 operand tiles measured 295 KiB via AOT compile). The
-            # interpreter tier validates semantics in f32; the init-time
-            # self-test validates the shipped bf16 path on real silicon.
-            DOT_BF16=not _IS_INTERPRET,
+            # The Triton interpreter (numpy) cannot emulate bf16 dots, so the
+            # interpreter tier always validates semantics in f32. The GPU
+            # build defaults to bf16 operands (smem, speed); VLLM_DSV4_MLA_DOT_FP32=1
+            # opts into the f32/tf32 dot with the BLOCK_N=16 tile above. The
+            # init-time self-test validates whichever path is shipped.
+            DOT_BF16=not _IS_INTERPRET and not _MLA_DOT_FP32,
             num_warps=4,
             num_stages=1,
         )

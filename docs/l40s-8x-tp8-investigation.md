@@ -51,6 +51,102 @@ the long-context path. A 2-14k prompt sweep is the instrument for that, and it
 needs sub-2048 points as a control (below 2048 the indexer top-k is a no-op,
 which is exactly why those bugs stayed invisible for so long).
 
+## EXPERIMENT IN FLIGHT (started 2026-08-02 evening): fp32 sparse-MLA dot
+
+**Status: running. Result not yet in.** Serving as `deepseek-v4-flash-dotf32`,
+log `logs/tp8-dotf32.log`.
+
+### The change
+`VLLM_DSV4_MLA_DOT_FP32=1` (launcher: `MLA_DOT=fp32`) runs the sparse-MLA
+attention dots in fp32 on tf32 tensor cores instead of bf16, and halves
+`BLOCK_N` 32 -> 16 because fp32 operand tiles measured 295 KiB via AOT compile
+against Ada's 99 KiB smem. Both parts are required; the tile size is not
+optional.
+
+Provenance: iSevenDays/vLLM-Moet@`b158280`, which measured **16K needle
+0.948 -> 0.966** from this change. That was on his IQ2_XXS expert path, so the
+magnitude should not be expected to carry to Marlin — attention-dot precision
+is orthogonal to expert quantization, but his baseline is not ours.
+
+### Why we expected it to matter
+The init self-test has always printed `worst_row_rel ~7.6e-03` for the bf16
+path and the runbook called that "expected". It is a **per-layer** number that
+compounds across 43 layers, and bug #4 established that this model turns 1 bf16
+ULP in an expert output into ~0.09 nats median at the prompt-logprob level.
+A 7.6e-03 per-layer attention error is a far larger perturbation than the one
+that cost a day of investigation.
+
+### What the self-test actually said
+**7.634e-03 -> 6.849e-03.** Change confirmed live (kernel build hash
+`c873e024981d` -> `bb0f20ac5cc7`), but that is only ~10% where bf16 (8 mantissa
+bits) -> tf32 (11) should be ~8x.
+
+**The reason is structural and worth remembering: the fp32 dot only upgrades
+one operand.** `q` arrives from the model as bf16, so `q.to(tl.float32)` widens
+the container without recovering a single bit — the query stays 8-bit-mantissa
+on both paths. Only `k` (dequantized to fp32 in `_dsv4_gather_k`) and `p` (the
+fp32 softmax probabilities) actually gain precision. Roughly half the
+arithmetic improved, and the self-test agrees.
+
+Caveat on reading that number at all: the self-test compares kernel vs torch
+reference, and **both read the same fp8 bytes**, so fp8 KV quantization error is
+common-mode and invisible to it. The 10% bounds how much of the kernel-reference
+divergence the dot was responsible for. It says nothing about absolute error,
+and nothing about end-to-end quality. Only the eval answers that.
+
+### Cost: apparently nil
+| | bf16 dot (baseline) | fp32 dot |
+|---|---|---|
+| decode tok/s, 1K/512, c=1 | 54.63 | 54.38 |
+| median TPOT | 18.15 ms | 17.78 ms |
+| median TTFT | 324 ms | 312 ms |
+
+Within run-to-run noise at n=3, despite `BLOCK_N` halving. Decode is
+bandwidth-bound here so the extra N-loop iterations hide under memory traffic.
+**Not yet measured at 8K prefill or high concurrency**, which is where a
+compute-bound cost would show. Do that before believing "free".
+
+### The probe: `sequence`
+Chosen because it has the most headroom (0.837) *and* because its failure mode
+matches the mechanism: highest truncation in the suite (8.4%) and by far the
+longest completions (4,054 tokens vs 463 for `tables`). A compounding per-layer
+attention error is a long-generation pathology; `tables` could not show it.
+
+Baselines to beat — **cloud scores the same 0.837 ± 0.016** (n=1963) with
+*higher* truncation (9.1%) and longer completions (4562).
+
+### How to read the result
+- **No movement** -> the dot was not the lever; drop it (it costs nothing but
+  complexity) and go to int8 KV, which attacks the operand the dot cannot.
+- **Local improves past cloud** -> we are no longer matching the reference, we
+  are beating it. That is plausible (cloud runs Hopper/Blackwell attention
+  kernels with their own precision choices) and is not a bug, but it changes the
+  claim from "indistinguishable from cloud" to "better than cloud", which needs
+  its own evidence. Cloud is a correctness reference, not a precision ceiling.
+- **Local degrades** -> suspect the `BLOCK_N=16` tiling, not the precision.
+
+### Queue behind this
+1. **int8 KV** (`VLLM_DSV4_KV_INT8=1`, iSevenDays). The packed `fp8_ds_mla` row
+   already carries a per-64-element UE8M0 power-of-two scale, which makes
+   E4M3's own exponent bits largely redundant. Reinterpreting the byte as
+   signed int8 gives **7 mantissa bits + sign instead of 3 + sign at identical
+   storage** — same 584 B/token, same KV pool, zero extra VRAM. Implemented as
+   a second pass that overwrites only the 448 NoPE data bytes + 7 scale bytes
+   after the stock C++ op, so no CUDA kernel replacement. This is the larger
+   lever and it attacks what the fp32 dot cannot. Run it *after* this
+   experiment resolves, not alongside — both are precision levers on the same
+   failure mode and simultaneous changes are unattributable.
+2. **dspark IMA discriminator.** Our crash is an illegal memory access at
+   ~2k tokens. Two candidate causes, separable in one run: does it crash at a
+   fixed *token position* (~2048, where the compressed candidate count hits
+   `index_topk=512` and top-k flips from no-op to real selection — exactly
+   where bugs #1 and #2 lived) or on a fixed *batch index* (the padded-tail
+   leak that `dspark_pad_to_bucket` addresses)? Position -> boundary bug.
+   Batch -> padded tail. Note iSevenDays' T7 found `deepseek_mtp` fails at
+   *weight load* on 0731 (`KeyError: model.layers.43.mtp_block.main_norm.weight`,
+   the checkpoint is DSpark-bound), which is a different failure and does not
+   explain ours.
+
 ## What is different from the 4x box
 
 | | 4x box (CLAUDE.md) | this box |

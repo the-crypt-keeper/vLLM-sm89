@@ -60,6 +60,29 @@ ENFORCE_EAGER=${ENFORCE_EAGER:-0}
 # into reasoning_content and tool_calls. Use when the eval harness does its own
 # parsing and you want zero server-side transforms between model and scorer.
 PARSERS=${PARSERS:-1}
+# NAME_SUFFIX tags the served model name with the experiment, e.g.
+# NAME_SUFFIX=-dotf32 -> "deepseek-v4-flash-dotf32". The suffixed name is
+# FIRST, so it is what the API reports back in `model` and what lands in eval
+# output -- the data self-identifies instead of depending on which directory
+# you filed it under. The bare name and "auto" stay registered as aliases so
+# existing tooling keeps working against the same endpoint.
+NAME_SUFFIX=${NAME_SUFFIX:-}
+if [ -n "$NAME_SUFFIX" ]; then
+  SERVED_NAMES=("deepseek-v4-flash${NAME_SUFFIX}" deepseek-v4-flash auto)
+else
+  SERVED_NAMES=(deepseek-v4-flash auto)
+fi
+
+# MLA_DOT=fp32 runs the sparse-MLA attention dots on tf32 tensor cores instead
+# of bf16 (~11 vs ~8 mantissa bits) and halves BLOCK_N to 16 to fit Ada smem.
+# Quality lever for long context; costs throughput. See the knob's comment in
+# overlay/vllm/vllm/v1/attention/ops/triton_sparse_mla_dsv4.py.
+MLA_DOT=${MLA_DOT:-bf16}
+case "$MLA_DOT" in
+  bf16) export VLLM_DSV4_MLA_DOT_FP32=0 ;;
+  fp32) export VLLM_DSV4_MLA_DOT_FP32=1 ;;
+  *) echo "MLA_DOT must be bf16|fp32 (got '$MLA_DOT')" >&2; exit 1 ;;
+esac
 
 # SPEC: none | dspark | mtp
 #   dspark = official GA path (model card): block drafting, 7 tokens, greedy.
@@ -122,10 +145,10 @@ else
   PARSERARGS=()
 fi
 
-echo "serving $MODEL  tp=$TP port=$PORT maxlen=$MAXLEN util=$UTIL batched=$BATCHED_TOKENS seqs=$NUM_SEQS graphs=[$CUDAGRAPH_SIZES] mode=$CUDAGRAPH_MODE prefix-cache=$PREFIX_CACHING spec=$SPEC(${SPEC_TOKENS}) det-moe=$VLLM_DSV4_DETERMINISTIC_MOE W2=off(marlin)"
+echo "serving $MODEL  tp=$TP port=$PORT maxlen=$MAXLEN util=$UTIL batched=$BATCHED_TOKENS seqs=$NUM_SEQS graphs=[$CUDAGRAPH_SIZES] mode=$CUDAGRAPH_MODE prefix-cache=$PREFIX_CACHING spec=$SPEC(${SPEC_TOKENS}) det-moe=$VLLM_DSV4_DETERMINISTIC_MOE mla-dot=$MLA_DOT name=${SERVED_NAMES[0]} W2=off(marlin)"
 
 exec ./venv/bin/vllm serve "$MODEL" \
-  --served-model-name deepseek-v4-flash auto \
+  --served-model-name "${SERVED_NAMES[@]}" \
   --trust-remote-code --tokenizer-mode deepseek_v4 \
   --tensor-parallel-size "$TP" --disable-custom-all-reduce \
   --kv-cache-dtype "$KV_DTYPE" --block-size "$BLOCK_SIZE" \
