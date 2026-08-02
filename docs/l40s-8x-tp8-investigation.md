@@ -302,7 +302,62 @@ pattern to distrust: **a test whose passing regime excludes the failure mode.**
   calibration: ~1 ULP amplified. This looks like a discrete *selection* flip
   driven by a tiny score perturbation, not corruption.
 
-### Next step: the oracle already exists
+### ORACLE RESULT (2026-08-02): not tie-breaking, not masking — the sparse attention path
+Ran `VLLM_DSV4_TOPK_ORACLE` with `_PREFILL=1`, `ENFORCE_EAGER=1`,
+`CUDAGRAPH_MODE=NONE`, caching off (a cache hit skips prefill and emits no
+records), two byte-identical requests, comparing records grouped by
+`(layer, compressed seq_len)`.
+
+**1. It is not tie-breaking.** 20/21 layers had *logits* differing between the
+two runs; 0/21 had identical logits with a differing selection; 0/21 had any tie
+at the cut line. Both runs scored `exact: true, miss: 0, hit: 512`. The selector
+is doing its job perfectly on inputs that already differ.
+
+**2. It is not "masked below 2048" — it is absent there.** With `_MIN=0`:
+
+| compressed seq_len | logits differ | max rel | first diverging layer |
+|---|---|---|---|
+| 256 | 0/21 | 0.00% | – |
+| 379 | 0/21 | 0.00% | – |
+| **512** | **0/21** | **0.00%** | – |
+| **515** | **20/21** | **4.45%** | **4** |
+
+Bit-identical at exactly `k_select = 512` compressed candidates, nondeterministic
+at 515. The `>k_select` regime *creates* the nondeterminism rather than merely
+revealing it. (Earlier working hypothesis — that a race existed everywhere and
+the no-op absorbed it — is **wrong**, disproved by this table.)
+
+**3. The MoE is exonerated.** `det-moe=1` was active and the MoE runs at every
+layer irrespective of sequence length. A racy MoE would diverge at seq 256/379/512
+too. It does not.
+
+**4. Onset and growth.** Divergence appears by layer 4 and compounds with depth:
+
+| layer | 4 | 10 | 18 | 26 | 34 | 42 |
+|---|---|---|---|---|---|---|
+| rel Δ finite_max | 0.50% | 1.08% | 1.47% | 1.54% | 1.79% | 3.86% |
+
+Caveat on reading the onset: `finite_max` is a scalar summary, so a layer whose
+max matches is not proven bit-identical row-wise, and only every other layer
+carries an indexer. Read it as "present by layer 4", not "originates at layer 4".
+
+**Where that leaves the suspect.** Layer 2's logits are identical and its
+selection is exact with no tie, so layer 2 selects the same 512 indices in both
+runs — yet layer 4's logits differ. The perturbation is injected between them,
+by something that engages only when the selection is real: the **sparse-MLA
+attention over a scattered 512-of-N gather** (`triton_sparse_mla_dsv4.py`, fork
+code, same file family as bug #2). Below the boundary every candidate is
+selected and that path is either bypassed or degenerate.
+
+**Confirmatory test, not yet run:** `VLLM_DSV4_DOUBLE_MODULE=<sparse attn
+substring>` calls the module three times on identical inputs and reports
+disagreement (three, not two, so an accumulating output buffer shows as a
+growing delta rather than a false positive). At ctx 2047 that is a direct
+yes/no on "this kernel is racy", with no inference from downstream logits.
+Needs `ENFORCE_EAGER=1`; `SharedExperts` asserts single-call, so filter to the
+attention module.
+
+### Superseded: the tie-breaking hypothesis and the oracle plan
 `VLLM_DSV4_TOPK_ORACLE` with `_DET=1` recomputes the logits and reports whether
 they are reproducible. That separates the two candidates directly:
 - logits bitwise reproducible but selection differs → **tie-breaking** in the
