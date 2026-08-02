@@ -35,7 +35,16 @@ BLOCK_SIZE=${BLOCK_SIZE:-256}
 UTIL=${UTIL:-0.95}
 BATCHED_TOKENS=${BATCHED_TOKENS:-1024}
 NUM_SEQS=${NUM_SEQS:-32}
-CUDAGRAPH_SIZES=${CUDAGRAPH_SIZES:-1,2,4,8,16,32}
+# Capture ladder must REACH NUM_SEQS. It used to be hard-coded to 1..32, so
+# raising NUM_SEQS to 128 left every batch above 32 with no captured graph --
+# a measured 3.7x decode cliff, and silent (the log says "Graph capturing
+# finished" either way). Derive it: powers of two up to NUM_SEQS, plus
+# NUM_SEQS itself when it is not one. Costs ~0.1 GiB per extra size.
+if [ -z "${CUDAGRAPH_SIZES:-}" ]; then
+  _s=""; _n=1
+  while [ "$_n" -lt "$NUM_SEQS" ]; do _s="${_s}${_s:+,}$_n"; _n=$((_n * 2)); done
+  CUDAGRAPH_SIZES="${_s}${_s:+,}$NUM_SEQS"
+fi
 # FULL_AND_PIECEWISE | PIECEWISE | NONE. DSpark replays FULL graphs and captured
 # only 3 sizes vs the main model's 6 on 2026-08-01; a batch shape outside those
 # faulted in cudagraph_utils.run_fullgraph -> graph.replay(). Drop to PIECEWISE
@@ -86,6 +95,17 @@ esac
 # First boot JITs every Triton kernel (sparse MLA, FP8 o_proj) — keep the
 # engine-ready window wide, and persist JIT caches so later boots are fast.
 export VLLM_ENGINE_READY_TIMEOUT_S=${VLLM_ENGINE_READY_TIMEOUT_S:-1800}
+
+# Deterministic MoE is ON by default here, not a debugging opt-in (bug #3/#4).
+# moe_align_block_size assigns each token's slot with an atomicAdd return value,
+# so the bucketing is thread-arrival-ordered; marlin's DP + stream-K schedule
+# then makes the fp32 accumulation grouping a function of which block a row
+# lands in, so that ordering leaks into the numerics at ~1 ULP. On this model
+# 1 ULP is worth ~0.09 nats median at the prompt-logprob level, so without this
+# greedy decoding is not reproducible. Costs ~5.3% decode throughput.
+# Still overridable: =2 (reversed order) is the order-invariance regression
+# gate, =0 restores stock nondeterministic behaviour for A/B.
+export VLLM_DSV4_DETERMINISTIC_MOE=${VLLM_DSV4_DETERMINISTIC_MOE:-1}
 CACHEROOT=${CACHEROOT:-$HOME/.cache/moet-l40s}
 export TRITON_CACHE_DIR=$CACHEROOT/triton
 export TORCHINDUCTOR_CACHE_DIR=$CACHEROOT/torchinductor
@@ -102,7 +122,7 @@ else
   PARSERARGS=()
 fi
 
-echo "serving $MODEL  tp=$TP port=$PORT maxlen=$MAXLEN util=$UTIL batched=$BATCHED_TOKENS seqs=$NUM_SEQS graphs=[$CUDAGRAPH_SIZES] mode=$CUDAGRAPH_MODE prefix-cache=$PREFIX_CACHING spec=$SPEC(${SPEC_TOKENS}) W2=off(marlin)"
+echo "serving $MODEL  tp=$TP port=$PORT maxlen=$MAXLEN util=$UTIL batched=$BATCHED_TOKENS seqs=$NUM_SEQS graphs=[$CUDAGRAPH_SIZES] mode=$CUDAGRAPH_MODE prefix-cache=$PREFIX_CACHING spec=$SPEC(${SPEC_TOKENS}) det-moe=$VLLM_DSV4_DETERMINISTIC_MOE W2=off(marlin)"
 
 exec ./venv/bin/vllm serve "$MODEL" \
   --served-model-name deepseek-v4-flash auto \

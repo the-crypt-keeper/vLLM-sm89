@@ -20,5 +20,8 @@ bench/results/smoke/
 # baseline clone at the repo root (read-only, pinned at v0.25.1).
 # Anchored so it does NOT match overlay/vllm/ which IS tracked.
 /vllm/
+
+# server logs from local runs (large, and they carry request text)
+/logs/
 .omc
 .codebase-memory
