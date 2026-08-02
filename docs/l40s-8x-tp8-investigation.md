@@ -7,7 +7,7 @@ Field-tested 2026-08-01/02 on the 8x box. Launcher: `serve_l40s_ds4_tp8.sh`.
 ## VALIDATED against the DeepSeek cloud API (2026-08-02)
 
 After bugs #1-#4 and the reasoning-effort ladder were fixed, a 26,901-prompt
-ReasonScape run on this box lands **statistically indistinguishable from the
+[ReasonScape](https://github.com/the-crypt-keeper/reasonscape) run on this box lands **statistically indistinguishable from the
 DeepSeek cloud API** on the task where both were measured, and the model places
 #5 on the ReasonScape leaderboard with strong thinking-efficiency.
 

@@ -56,7 +56,7 @@ wrong: the model was coherent, benchmarks looked plausible, and the defects only
 showed up as a slightly elevated rate of runaway generations.
 
 Head-to-head against the DeepSeek cloud API, matched prompts and sampler
-(ReasonScape `dates`):
+([ReasonScape](https://github.com/the-crypt-keeper/reasonscape) `dates`):
 
 | arm | n | invalid | trunc | score |
 |---|---:|---:|---:|---|
@@ -88,7 +88,7 @@ Full local sweep, **26,901 prompts**, invalid rate 0.0008:
 **0.837 ± 0.016** on it too (n=1963), with *higher* truncation (9.1% vs 8.4%)
 and longer completions. Identical to three decimals.
 
-Evaluation is ReasonScape. Method and the full investigation record: [`docs/l40s-8x-tp8-investigation.md`](docs/l40s-8x-tp8-investigation.md).
+Evaluation is [ReasonScape](https://github.com/the-crypt-keeper/reasonscape). Method and the full investigation record: [`docs/l40s-8x-tp8-investigation.md`](docs/l40s-8x-tp8-investigation.md).
 
 **What this does not cover.** These prompts average 366 tokens. Nothing in the
 suite reaches the L=2048 boundary where two of the four bugs lived, so the
