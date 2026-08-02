@@ -1,467 +1,244 @@
-# Frontier MoE on Ada and consumer Blackwell
+# DeepSeek-V4-Flash on Ada (sm89) — validated, not just running
 
-This project serves large Mixture-of-Experts models on Ada and Blackwell GPUs.
-The active Ada image uses official vLLM v0.25.1 at commit `752a3a504`.
-It applies generated per-file patches from `patches/`.
-The full source files in `overlay/vllm/` are the source of those patches.
-Historical Blackwell measurements in this document used the v0.24.0 image.
+This fork serves **DeepSeek-V4-Flash (159B MoE)** on **NVIDIA L40S / Ada (sm_89)**
+using the checkpoint's **stock MXFP4 experts through Marlin** — no exotic
+quantization, no 2-bit codebooks, no hand-written SASS. Base is official vLLM
+**v0.25.1** at commit `752a3a504` plus generated per-file patches from `patches/`.
 
-The supported models include **GLM-5.2 (753B)**,
-**DeepSeek-V4-Flash (159B)**, and **Kimi-K2.7-Code (1T)**.
-Three methods make these configurations possible:
+The distinguishing claim is not that it runs. It is that the output has been
+**measured against the DeepSeek cloud API and found statistically
+indistinguishable** — after four correctness bugs that were invisible to every
+self-test in the stack were found and fixed.
 
-1. **2‑bit experts with FP4 recovery** — routed experts compress to a sign‑symmetric 2‑bit
-   codebook on hand‑written SM120 SASS kernels; a runtime FP4 tier (delta cache + confidence
-   gate) restores precision exactly where it matters.
-2. **Tiered expert residency** — when even the 2‑bit base outgrows VRAM, it moves to pinned
-   host RAM — and, one tier further, to an **NVMe pack file with a pinned‑RAM arena** — and
-   the GPU becomes an **expert cache** (miss → batched fetch + bit‑identical graph replay).
-   That puts 753B on two 96 GB cards and 159B on a single RTX 5090, and the packs double as
-   a **persistent quantization cache** (reboots skip the re‑quant).
-3. **A patched serving base** - The Ada image uses vLLM v0.25.1. The historical SM120 image
-   uses vLLM v0.24.0. The runtime also supports MTP speculative decoding, an NVFP4 KV cache
-   on Blackwell, and tool and reasoning parsers.
+<!-- BENCH_TABLE -->
 
 ---
 
-## GLM‑5.2 (753B) — the headline model
+## Validation
 
-Served from the official [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4)
-checkpoint (433 GB): the loader re‑quantizes modelopt NVFP4 experts (e2m1 × e4m3 block‑16 ×
-per‑tensor scale_2) to the sign‑symmetric 2‑bit planes at load — f64‑exact vs the reference
-pipeline on real shards. Single‑stream, greedy, CUDA graphs:
+Ada had no working DSV4 sparse-MLA kernel, so the port routes attention through
+vLLM's Triton port. That path was *nearly* right, which is the dangerous kind of
+wrong: the model was coherent, benchmarks looked plausible, and the defects only
+showed up as a slightly elevated rate of runaway generations.
 
-| hardware | config | decode | max context window (served, needle‑validated) | host RAM |
-|---|---|---:|---:|---:|
-| **4× RTX PRO 6000 (TP4)** | 2‑bit + **MTP k=2** | **105 tok/s** | **256K** | — |
-| 4× RTX PRO 6000 (TP4) | 2‑bit + MTP k=2 + **FP4 delta + confidence gate** | **83–85 tok/s** | 128K | — |
-| **2× RTX PRO 6000 (TP2)** | **three‑tier + NVMe stores** + MTP + gate | **28–32 tok/s** | **128K** | **~140 GiB** |
+Head-to-head against the DeepSeek cloud API, matched prompts and sampler
+(ReasonScape `dates`):
 
-- **4 cards:** prefill ~2.5k tok/s; MTP acceptance 2.3–2.8; needle retrieval **PASS to 126K**
-  on the nvfp4 KV cache and **to 276K** on fp8 (331K window fits at util 0.95). GLM's nominal
-  1M window is KV‑bound on 4 cards. Tool calling (`glm47`) + reasoning (`glm45`) parsers work
-  out of the box — the endpoint drives coding agents (opencode) directly.
-- **2 cards — a model that doesn't fit, running anyway:** the 2‑bit planes alone (~190 GiB)
-  match the entire 2‑GPU VRAM budget. **Three tiers** make it work: NVMe pack + 57 GiB/rank
-  pinned arena for the 2‑bit base → 46 GiB/rank GPU expert cache → a small gate‑filled FP4
-  pool for precision (expert stores need ~136 GiB host RAM instead of ~568 pinned). The
-  single‑user window is real: `--max-model-len 131072` with 8 GiB/rank KV = **157K tokens of
-  KV measured**, needle retrieval **4/4 PASS at 36K / 86K / 121K prompt tokens** (fp8 KV,
-  tol=0). Decode (MTP k=2, acceptance ~2.9): **28.3 tok/s** strict (tol=0), **31.7** at
-  miss‑tolerance 8 — arithmetic and retrieval probes clean at both. Bare‑2‑bit quality
-  artifacts ("capital of Poland: Krakow", garbled Polish) are corrected by the FP4 tier.
-  Booting from existing quantization packs takes **~7 min** (vs ~11 for a full
-  re‑quantizing load, which also stages ~405 GiB of transients).
-- **NVFP4 KV cache** (`--kv-cache-dtype nvfp4`): packed 352 B/token vs 656 B `fp8_ds_mla` —
-  **+38% KV pool** (415K → 571K tokens at equal settings) at decode parity, or the freed VRAM
-  goes to the FP4 pool (the standing 4‑card config runs a 19.6 GiB/GPU pool + 175K‑token KV).
+| arm | n | invalid | trunc | score |
+|---|---:|---:|---:|---|
+| this fork, 8x L40S TP8 | 1341 | 0 | 0.0022 | **0.972 ± 0.009** |
+| DeepSeek cloud API | 1336 | 0 | 0.0060 | 0.975 ± 0.008 |
 
-## DeepSeek‑V4‑Flash (159B)
+Difference **−0.003 ± 0.012** (z = 0.49). Prompt tokens were **149.2 on both
+arms** — the encoder renders byte-identical prompts to cloud.
 
-Official checkpoint, 2‑bit experts + FP4 delta cache, MTP k=2, CUDA graphs (single‑stream
-medians; prefill = 8k‑token prompt, uncached):
+Full local sweep, **26,901 prompts**, invalid rate 0.0008:
 
-| hardware | decode | prefill 8k | max context window (served, needle‑validated) | host RAM |
-|---|---:|---:|---:|---:|
-| **1× RTX PRO 6000 (96 GB)** | **161 tok/s** | **5 340 tok/s** | **512K** | — |
-| 2× RTX PRO 6000 (TP2) | 210 tok/s | 5 790 tok/s | 512K | — |
-| 4× RTX 5090 (TP4) | 214 tok/s | 6 100 tok/s | 16K | — |
-| **1× RTX 5090 (32 GB)** | **~31 tok/s** (14 GiB pool + NVMe stores) | ~400–540 tok/s | **32K** | **~30 GiB** |
+| base task | n | trunc | score | completion |
+|---|---:|---:|---|---:|
+| **all** | 26901 | 0.0124 | **0.954 ± 0.003** | 1691.6 |
+| tables | 3456 | 0 | 0.990 ± 0.003 | 463.2 |
+| arithmetic | 2078 | 0.0048 | 0.979 ± 0.006 | 2598.6 |
+| letters | 1727 | 0.0006 | 0.979 ± 0.007 | 1857.7 |
+| dates | 1338 | 0.0045 | 0.976 ± 0.008 | 645.2 |
+| shuffle | 3356 | 0.0012 | 0.976 ± 0.006 | 1188.0 |
+| objects | 2301 | 0.0013 | 0.965 ± 0.007 | 722.4 |
+| boolean | 2342 | 0.0242 | 0.963 ± 0.011 | 3751.4 |
+| cars | 2300 | 0.0017 | 0.945 ± 0.011 | 890.9 |
+| brackets | 2301 | 0.0013 | 0.942 ± 0.010 | 2287.1 |
+| sort | 2014 | 0.0010 | 0.940 ± 0.010 | 1172.8 |
+| shapes | 1710 | 0.0372 | 0.917 ± 0.013 | 1349.4 |
+| sequence | 1978 | 0.0843 | 0.837 ± 0.016 | 4053.5 |
 
-Retrieval behind the window column: needle PASS at 453K on the PRO 6000 (947K‑token KV
-measured) and at 29.7K on the single 5090 (131K‑token KV). "—" in host RAM = all‑VRAM
-config, no host expert store.
+`sequence` is the model's weak task, not a port defect: cloud scores
+**0.837 ± 0.016** on it too (n=1963), with *higher* truncation (9.1% vs 8.4%)
+and longer completions. Identical to three decimals.
 
-**Batched serving** (aggregate decode tok/s at N concurrent streams; per‑stream in
-parentheses at N=32):
+Evaluation is ReasonScape. Method and the full investigation record: [`docs/l40s-8x-tp8-investigation.md`](docs/l40s-8x-tp8-investigation.md).
 
-| concurrency | 1 | 4 | 8 | 16 | 32 |
-|---|---:|---:|---:|---:|---:|
-| 1× RTX PRO 6000 | 156 | 290 | 493 | 659 | **933** (29/stream) |
-| 4× RTX 5090 (TP4) | 198 | 460 | 762 | 1 006 | **1 560** (49/stream) |
-
-Four consumer 5090s match two PRO 6000s on decode. MTP acceptance ~2.6 tok/step across
-configs. MTP also runs under **pipeline parallelism** (draft propagation + drafter embedding
-share across ranks): DS4 on 4× RTX 5090 **PP4** does 184 tok/s vs 93 without (~2×), and greedy
-decode under PP is **bit‑deterministic** (6/6 identical runs, with and without MTP).
-Methodology: **[docs/v024-port.md](docs/v024-port.md)**.
-
-The Ada TP2 field configuration uses two 48 GiB RTX 4090 D cards and GPU-resident experts.
-The launcher sets a 30 GiB container memory limit. Before the native SM89 output-projection
-change, a two-request run reported 33.8 generated tokens/s. This value is not comparable to
-the single-stream RTX PRO 6000 values in the table. Rebuild the Ada image before you measure
-the new kernel. See [docs/ada-sm89-port.md](docs/ada-sm89-port.md).
+**What this does not cover.** These prompts average 366 tokens. Nothing in the
+suite reaches the L=2048 boundary where two of the four bugs lived, so the
+**long-context path is not yet validated** — a 2–14k prompt sweep is pending.
+Treat long-context behaviour as untested rather than working.
 
 ---
 
-## How it fits - 2-bit experts with FP4 recovery
+## What was broken
 
-We compress **only the routed experts** to 2 bits (the dense stack keeps the checkpoint's
-precision — FP8 on DS4, NVFP4 on GLM) and recover FP4 precision adaptively:
+Four correctness bugs, each found by comparing measured *rates* against a cloud
+reference and then bisected with instrumentation. None of them threw an error;
+none were caught by the existing self-tests.
 
-- **2‑bit expert planes — the sign‑bias finding.** Naive 2‑bit *destroys* these models
-  (degenerate loops). The cause is **sign asymmetry**, not error magnitude — the optimal‑L2
-  codebook drops one sign's tail and the per‑expert bias compounds over dozens of layers.
-  Forcing a **sign-symmetric** `{-4,-1,1,4}` codebook removes the sign bias
-  (33,023 of 33,024 DS4 tensors pick it). A small `QUANT_PROBE` study reported MTP
-  acceptance of 2.73, compared with 2.68 for the FP4 control. This result is an
-  ablation result, not a production parity result. The finding reproduces on **GLM-5.2** (180-tensor
-  sweep: asym bias −0.042, 99% negative; symmetric 392× smaller at equal rel‑RMS).
-- **FP4 recovery — used surgically.** Decode is HBM‑bound and an FP4 read is 2× the bytes, so
-  2‑bit is the *fast* default: a **delta cache** keeps the hot experts at FP4 (background
-  promote/evict, CUDA‑graph‑safe, `VLLM_MOE_W2_DELTA_GB=auto` sizes it from post‑KV VRAM),
-  and a **confidence gate** (`VLLM_MOE_W2_GATE=1`) re‑runs low‑confidence steps at FP4 —
-  force‑promote the step's routed experts, replay the graph once, re‑decide. Works inline on
-  TP/single‑GPU (incl. MTP verify steps) and as a full‑pipeline replay under PP; τ tunable at
-  runtime.
-- **The kernels.** `moe_w2_mm` (2‑bit MoE GEMM: PRMT‑LUT in‑register decode → `QMMA.SF`
-  block‑scaled tensor cores, 4 CTA/SM) and `moe_w4_mm` (FP4 delta GEMM) — hand‑written SASS,
-  shipped as sources + prebuilt cubins for every sharding (K = 6144/4096/2048/1024/512), so
-  TP2/TP4 work out of the box. Op‑validated (rel ~1–3e‑3, deterministic), graph‑capture‑exact.
-  Prefill runs the **AFRAG** variant (fragment‑major activations → one `LDG.128` per QMMA
-  A‑fragment; the prefill GEMM is load‑issue‑bound, not DRAM‑bound): bit‑identical outputs,
-  1.3× on the GEMM, **+12% e2e prefill** on one card — default on (`VLLM_MOE_W2_AFRAG=0`
-  opts out).
+**1 — decode top-k selection past context 2048.** DSV4's lightning indexer
+selects `index_topk=512` candidates. The ratio-4 layers cross that threshold at
+exactly L=2048 (compressed count L/4 = 512). The radix top-k selectors were
+being handed an unclamped `k_select`; below 2048 selection is a no-op so nothing
+showed, above it the model selected badly.
 
-On Ada, the 2-bit MoE kernel decodes the expert codes in registers and uses BF16 tensor
-cores. DeepSeek-V4 uses a separate native SM89 FP8 kernel for its attention output
-projection. This kernel does not materialize dequantized FP32 weights. See the Ada port
-guide for the dispatch rules and validation results.
+**2 — the indexer KV cache was read with the wrong byte layout.** The writer
+stores each block **segregated** — `[block_size×D keys][block_size×4 scale
+bytes]` — while the sm89 decode kernel read it **interleaved**, as `[D+4]` per
+token. Every decode candidate score was garbage (−1e27 … 1e33, NaN) while
+prefill over the same tokens scored 1.1–3.8. Below 2048 the top-k is a no-op, so
+garbage scores cost nothing; past 2048 the model selected 512 essentially
+arbitrary candidates. Fixing it moved truncations from 11/40 to 2/40 (p=0.0129)
+and "reached 6500 tokens then finished" from 0.214 to 0.882 (p=0.00026),
+landing on the cloud reference (p=0.428, null).
 
-All three checkpoint flavors load: **FP4 experts** (DeepSeek‑V4‑Flash — codes remap),
-**FP8 block‑quant** (Flash‑Base, GLM‑5.2‑FP8) and **modelopt NVFP4** (GLM‑5.2‑NVFP4) — the
-latter two re‑quantized to the sign‑symmetric codebook at load, float64‑exact vs the
-reference pipeline.
+**Why the self-test passed:** the kernel, the torch reference and the reference
+packer all shared the same wrong layout. The test compared three implementations
+of the same mistake. It is now checked against the **real writer** with f32
+ground truth computed pre-quantization — a test that can actually fail.
 
----
+**3 — greedy decoding was not deterministic.** `moe_align_block_size` assigns
+each token's slot within its expert with an `atomicAdd` return value, so the
+bucketing is thread-arrival-ordered and varies run to run.
 
-## When the model doesn't fit at all — the GPU as an expert cache
+**4 — and that ordering changed the numbers.** It should not have: DeepSeek's
+reference MoE has no bucketing at all, and per-row dot products are permutation
+invariant. But Marlin schedules tiles as DP + two-tile stream-K, and
+`slice_count` — how the fp32 partial sums are *grouped* before the bf16 store —
+is derived from the global tile index, which is keyed on the block index. A row
+that moves between blocks of the same expert gets a different, equally valid
+summation grouping. Measured over 172 calls/rank: differing rows were **always**
+a subset of rows that changed block (`diff_not_moved == 0`, every call), and
+every difference was **≤ 1 bf16 ULP**.
 
-`VLLM_MOE_W2_BASE_CACHE_GB=N` inverts residency: the **whole 2‑bit base lives in pinned host
-RAM**, and the GPU holds only the dense stack, KV, and an N‑GiB **cache of hot experts** (the
-delta‑tier slot machinery, read inside CUDA graphs; background prefetch converges it to the
-routed working set). MoE routing is concentrated enough to make this practical: **~19%
-coverage serves ~96% of token→expert routings** on DS4, **~51% serves ~91%** on GLM —
-measured live, not simulated.
+One ULP is enough. Flipping the low mantissa bit of every 6th expert-output row
+— for reasons unrelated to ordering — moves prompt logprobs by median 0.0935
+nats, indistinguishable from what reordering does (0.0920). 43 layers plus a
+discrete top-512 selection amplify one ULP into tenths of a nat.
 
-Misses stay correct through the gate's replay trick: the desc kernel zeroes a missing
-expert's contribution and bumps an in‑graph miss counter; the runner fetches **all** missing
-routed experts in one batched pinned‑H2D transfer (51.6 GiB/s here; a 64‑expert fetch ≈ 3 ms)
-and replays the step's graph once — **bit‑identical** to a fully resident forward
-(unit‑tested). A **miss‑tolerance knob** (`VLLM_MOE_W2_BASE_MISS_TOL=k`, runtime‑tunable)
-skips the replay when ≤ k of the step's ~600 routings miss — +12% decode on GLM TP2 at
-tol 8 (28.3 → 31.7 tok/s) with clean quality probes (arithmetic, PL coherence, needle
-retrieval; quantitative eval pending).
+Consequence: the ordering cannot be made inert without changing Marlin's
+schedule, so **`VLLM_DSV4_DETERMINISTIC_MOE=1` is the fix**, not a workaround.
+It is on by default in the launcher and costs ~5.3% decode.
 
-**Pool size is the dominant knob — treat it as a config KPI.** The mandatory replay is paid
-*per step*, so decode tracks the fraction of **zero‑miss steps**, which falls off a cliff
-with coverage while the token hit‑rate barely moves. On DS4 (1× 5090, NVMe‑store stack,
-same box, same bench): 11 GiB pool / util 0.90 = **27–28 tok/s**, 14 GiB / util 0.95 =
-**~31 tok/s**. The engine reports the KPI directly: pool coverage at startup and a periodic
-**`[base] KPI: replay X% of last N steps…`** line (cadence `VLLM_MOE_W2_KPI_EVERY`, default
-500 steps). If replay % runs high, grow `VLLM_MOE_W2_BASE_CACHE_GB` (and free VRAM for it,
-e.g. `--gpu-memory-utilization 0.95`) before touching any other knob.
-
-**Misses are restored adaptively.** A replayed step can re‑route onto experts the first
-pass never fetched (second‑order misses); the runner re‑checks after each replay and keeps
-replaying **only while the step is within `VLLM_MOE_W2_FP_THRESH` of miss‑free** (default 0
-= the mandatory first‑order restore only, the throughput‑optimal setting; raising it buys
-bit‑deterministic fixed points on converged working sets at a decode cost — runtime‑tunable
-via `VLLM_MOE_W2_FP_THRESH_FILE`). The accepted residue is second‑order only and
-KPI‑visible (`fp-residue`).
-
-Results: **DeepSeek‑V4‑Flash 159B on one RTX 5090** (72.7 GiB of 2‑bit planes vs 32 GB of
-VRAM): ~31 tok/s steady with MTP, 32K window served, coherent — and ~30 GiB of host RAM
-with the NVMe stores (below, RSS‑measured) instead of ~80 GiB pinned.
-**GLM‑5.2 753B on two RTX PRO 6000**: 28–32 tok/s with the full three‑tier stack (NVMe 2‑bit
-base + pinned arena → GPU 2‑bit cache → GPU FP4) at a 128K single‑user window — see the GLM
-table above. Neither model can otherwise run on that hardware at any precision.
+**Bonus — `reasoning_effort` was shifted a rung.** vLLM shipped one constant
+holding DeepSeek's **high** text, emitted only for `"max"`. So `high` was
+silently identical to `low`, `max` delivered high, and the real `max` level was
+unreachable from any request. The official three-level ladder is restored from
+the encoder that ships with the checkpoint, verified byte-identical at
+`low`/`high`/`max`.
 
 ---
 
-## One tier further — expert stores on NVMe
+## Hardware
 
-`VLLM_MOE_W2_STORE_DIR=/path/on/real/fs` moves the host expert stores — the 73–190 GiB of
-2‑bit base planes, and the FP4 need‑pool sections when that tier is enabled — out of RAM
-into per‑rank **pack files**: raw rows at `(layer·E + expert) · stride`, 4 KiB‑aligned, JSON
-sidecar with shapes and the layers written. Three things fall out:
+Validated on **8x L40S** (sm_89, 48 GB, ECC off) and **4x L40S** (ECC on).
+Anything Ada with enough VRAM should work; the checkpoint is 156 GB, so plan
+~40 GB/card at TP4 or ~21 GB/card at TP8.
 
-- **The RAM wall falls.** Single‑5090 DS4 no longer needs ~80 GiB of free host RAM
-  (measured host RAM of the serving process: 42–44 → 26–33 GiB), and GLM TP2's expert
-  stores go **~568 → ~136 GiB** host RAM — the config fits hosts that could never hold the
-  pinned stores.
-- **The pack is a persistent quantization cache.** The first boot writes it while
-  quantizing; every later boot **skips the dequant→re‑quant entirely** and serves experts
-  straight from the pack — GLM TP2 boots in **~7 min instead of ~11** and skips the
-  ~405 GiB staging transient. Stale packs (shape/config mismatch) rebuild automatically;
-  layers absent from a pack (e.g. the MTP drafter) quantize as before.
-- **Decode stays at pinned parity — give it an arena.** `VLLM_MOE_W2_BASE_RAM_GB=<GiB|auto>`
-  pins an MRU **arena** over the base pack: arena hits are zero‑copy pinned views (H2D DMAs
-  straight from the arena — no syscall, no memcpy), misses read through the page cache into
-  the arena slot. The arena behaves as a victim cache of the GPU pool (85% of fetches served
-  from RAM at 27% arena coverage on DS4).
+| | 4x L40S (ECC on) | 8x L40S (ECC off) |
+|---|---|---|
+| weights resident | ~40 GB/card | ~21 GB/card |
+| served context | 32K | 16K |
+| KV pool at util 0.95 | 2.43 GiB / 158,769 tok | **22.8 GiB / 851,099 tok** |
+| concurrency at served context | 4.85x | **52x** |
 
-The three selectable host‑store backends, benched head‑to‑head (DS4 1× 5090, 11 GiB GPU
-pool, MTP k=2, same box and bench):
+(The two columns were measured at different `--max-model-len`, so read the pool
+sizes rather than the concurrency multiples. ECC accounts for ~3 GiB/card.)
 
-| host store | decode | host RAM (process RSS) |
-|---|---:|---:|
-| pinned — all 73 GiB in RAM (default) | 33.0 tok/s | 42–44 GiB |
-| pack only — page cache as the RAM tier | 25.5 tok/s | 15 GiB |
-| pack + **20 GiB pinned arena** | **32.8 tok/s (parity)** | 26–33 GiB |
+Topology matters for TP8: this box is two PIX islands (0-3 \| 4-7) joined by SYS
+across NUMA, so every all-reduce crosses the host bridge and custom all-reduce
+stays off. Check yours with `nvidia-smi topo -m`.
 
-GLM‑5.2 TP2 three‑tier with both stores on NVMe (57 GiB/rank arena): 28–32 tok/s steady,
-needle retrieval 4/4 to **121K prompt tokens** at a served 128K window. Enabling it is two
-env lines on any base‑cache config (DS4 shown; same two lines serve GLM TP2):
-
-```bash
-  -e VLLM_MOE_W2_STORE_DIR=/serve/packs \  # pack dir on a bind-mounted ext4/xfs
-  -e VLLM_MOE_W2_BASE_RAM_GB=20 \          # pinned MRU arena; "auto" = 25% of the pack
-```
-
-Operational notes:
-
-- **Disk budget:** DS4 pack 75 GB; GLM TP2 2×100 GB (base) + 2×189 GB (fp4) — plan ~1 TB of
-  NVMe for the full GLM stack including the checkpoint. Packs are read‑only after the first
-  boot (SSD wear is a non‑issue). The dir must be a real filesystem via bind mount — **not
-  overlayfs** (the container filesystem).
-- **You don't need a fast drive for steady decode.** Misses are buffered reads, so the page
-  cache acts as an opportunistic L3 under the arena — the parity numbers above come from a
-  drive on a PCIe **Gen3 x4** link (3.7 GB/s). Cold working‑set shifts and first‑touch
-  prefills do pay drive speed. `VLLM_MOE_W2_TIER_DIRECT=1` switches misses to O_DIRECT
-  (hard RAM budget, page cache stays flat; raw drive latency on every miss).
-- **Prefill can't wipe the arena** (scan discipline: prefill working sets fill free slots
-  but never evict the decode hot set), and the arena's hot set persists to
-  `<pack>.heat.json` and **preheats on boot** (57 GiB ≈ 35 s; `VLLM_MOE_W2_TIER_PREHEAT=0`
-  opts out). Reader pool: `VLLM_MOE_W2_STORE_THREADS` (default 8).
-- **Observability:** with `VLLM_MOE_W2_DELTA_TRACE=1` the summary carries a
-  `[base] tiered store: arena N/M | fetch rows X ram + Y nvme (Z% ram) | … p50/p99` line —
-  the ram‑hit % *is* the arena‑coverage curve; grow `BASE_RAM_GB` if it sags.
-- Replays stay **bit‑identical** across backends (bytes are bytes; only the copy source
-  changes) — unit‑tested per backend × cold/warm/reboot/evict/overflow/scan/preheat in
-  `tools/test_store_backends.py`.
-
----
-
-## The base: vLLM v0.24.0 on SM120
-
-Upstream v0.24.0 ships DeepSeek‑V4 + GLM‑5.x + SM120 natively — but the release cannot
-actually serve them on SM120. The patch carries the fixes (details in
-[docs/v024-port.md](docs/v024-port.md)):
-
-- **DeepGEMM**: release pin has no family‑120 host paths ("Unknown SF transformation",
-  einsum/indexer asserts) → pin **nv‑dev `a6b593d2`** (as vLLM main did).
-- **flashinfer**: official 0.6.12 pin predates the SM120 DS4 attention API → **0.6.14**.
-- `cooperative_topk` uses thread‑block **cluster launch** (SM90/100‑only) → gated off on SM12x.
-- o_proj fp8 einsum: SM100 packed scale layout NaNs on SM120 → SM90‑style raw f32 scales.
-- CUDA‑graph capture: `thread_local` error mode on **all four** capture paths (the expert
-  caches' background threads must not invalidate capture).
-
-With the 2‑bit knobs off, the patch is exactly these base fixes — stock behaviour otherwise.
+Driver with CUDA 13.0 (tested 580.95.05). ECC off roughly doubles the KV pool;
+that is a per-box integrity call.
 
 ## Quickstart
 
 ```bash
-git clone https://github.com/kacper-daftcode/vLLM-Moet && cd vLLM-Moet
+git clone https://github.com/the-crypt-keeper/vLLM-sm89 && cd vLLM-sm89
+uv venv --python 3.12 venv
+uv pip install --python venv/bin/python vllm==0.25.1     # the patch baseline
 
-# official vllm-openai:v0.24.0 image + patch + pins + SM120 cubins
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-v024 -t vllm-moet-sm120:v024 .
+# FlashInfer pin swap (mandatory: 0.6.13 lacks swa_topk_lens)
+uv pip uninstall --python venv/bin/python flashinfer-cubin
+uv pip install --python venv/bin/python flashinfer-python==0.6.14
+uv pip install --python venv/bin/python --index-url https://flashinfer.ai/whl/cu130 \
+  "flashinfer-jit-cache==0.6.14+cu130"
+
+# apply the patches FROM THE REPO ROOT (see the gotcha below)
+git apply --directory=venv/lib/python3.12/site-packages --verbose patches/*.patch
+
+hf download deepseek-ai/DeepSeek-V4-Flash-0731 --local-dir /path/to/model
+MODEL=/path/to/model NUM_SEQS=128 ./serve_l40s_ds4_tp8.sh
 ```
 
-**Easiest path — run a benchmarked recipe.** The recipes image downloads the
-checkpoint from HuggingFace on first run and starts the exact configuration
-the benchmark table below was measured with (one recipe per supported
-model×hardware combo, see `bench/recipes/`):
+The launcher defaults to `TP=8`; on a four-card box use `TP=4 MAXLEN=32768`.
+Every knob is an env override — `MODEL PORT TP MAXLEN UTIL NUM_SEQS
+BATCHED_TOKENS KV_DTYPE BLOCK_SIZE PREFIX_CACHING SPEC` — and the cudagraph
+capture ladder is derived from `NUM_SEQS`, so it always reaches your batch size.
+
+**Patch gotcha:** if site-packages sits inside a git work tree (a venv at the
+repo root does), running `git apply` *from* site-packages silently skips every
+patch — "Skipped patch", exit 0, and `--check` passes vacuously. Apply from the
+repo root with `--directory`, and confirm the count:
 
 ```bash
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.recipes -t vllm-moet-recipes:v024 .
-
-docker run --rm vllm-moet-recipes:v024 --list          # supported configs
-docker run --rm --gpus all --network host --ipc host --shm-size 64g \
-  -v /srv/models:/models -e HF_TOKEN=... \
-  vllm-moet-recipes:v024  glm-5.2-nvfp4/pro6000x4-tp4-mtp
+ls patches/*.patch | wc -l    # expected count
+git apply --directory=venv/lib/python3.12/site-packages patches/*.patch 2>&1 | grep -c "^Applied"
 ```
 
-(`-e KNOB=...` overrides any recipe knob, `<recipe> --print` shows what would
-run without serving, args after `--` go to vllm serve; details in
-[bench/README.md](bench/README.md).)
+Boot checklist — grep the log for all four:
 
-Or hand‑roll the serve. **GLM‑5.2 on 4× PRO 6000** (the standing agent‑serving config:
-128K window, MTP, FP4 pool + gate, tool/reasoning parsers):
+1. `Using MarlinExperts` (not TRTLLM, not DeepGEMM)
+2. `DeepSeek V4 o_proj: using native SM89 block-scaled FP8 grouped matmul`
+3. `DSv4 sparse-MLA Triton port self-test` passes
+4. `Available KV cache memory:` is **positive**
 
-```bash
-docker run --rm --gpus '"device=0,1,2,3"' --network host --ipc host --shm-size 64g \
-  -v /path/to/GLM-5.2-NVFP4:/model:ro \
-  -e VLLM_MOE_W2=1 -e VLLM_MOE_W2_DELTA_GB=auto -e VLLM_MOE_W2_GATE=1 \
-  vllm-moet-sm120:v024 \
-  --model /model --served-model-name glm-5.2 --trust-remote-code \
-  --tensor-parallel-size 4 --disable-custom-all-reduce \
-  --kv-cache-dtype fp8 --max-model-len 131072 \
-  --gpu-memory-utilization 0.90 --max-num-batched-tokens 2048 --max-num-seqs 4 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
-  --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45 \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
-  --port 8000
-```
+Full runbooks: [`docs/l40s-4x-runbook.md`](docs/l40s-4x-runbook.md) (4x box) and
+[`docs/l40s-8x-tp8-investigation.md`](docs/l40s-8x-tp8-investigation.md) (8x box
++ the bug hunt).
 
-(`--kv-cache-dtype nvfp4` enables the 352 B/token KV cache; the image ships it ready — the
-FlashInfer JIT sources are patched and precompiled at build (`tools/nvfp4_flashinfer_sm120/`,
-added to the vLLM tree by the patch) and the packed-write kernel is prebuilt at
-`/opt/nvfp4-ds-mla`. Currently validated to 128K windows.)
+## Knobs worth knowing
 
-**GLM‑5.2 on 2× PRO 6000** (three‑tier + NVMe stores, the 128K/needle‑121K config from the
-table; ~140 GiB host RAM + ~580 GB NVMe for the packs, first boot writes them):
+| env | default | what |
+|---|---|---|
+| `VLLM_DSV4_DETERMINISTIC_MOE` | `1` (launcher) | pins the MoE bucketing order. `=2` is the order-invariance regression gate, `=0` is stock nondeterministic behaviour. |
+| `VLLM_MOE_W2` | `0` | must stay 0. `=1` reroutes experts to the inherited 2-bit path, which is not what this fork validates. The launcher refuses to start if it leaks in. |
+| `VLLM_DSV4_SPARSE_MLA_SELFTEST` | `1` | keep on. |
+| `VLLM_DSV4_MARLIN_ORDER_CHECK` | off | diagnostics, see the investigation doc. |
 
-```bash
-docker run --rm --gpus '"device=0,1"' --network host --ipc host --shm-size 64g \
-  -v /path/to/GLM-5.2-NVFP4:/model:ro -v /nvme/packs-glm:/packs \
-  -e VLLM_MOE_W2=1 -e VLLM_MOE_W2_BASE_CACHE_GB=46 -e VLLM_MOE_W2_DELTA_GB=2 \
-  -e VLLM_MOE_W2_GATE=1 -e VLLM_MOE_W2_BASE_MISS_TOL=8 \
-  -e VLLM_MOE_W2_STORE_DIR=/packs -e VLLM_MOE_W2_BASE_RAM_GB=57 \
-  vllm-moet-sm120:v024 \
-  --model /model --served-model-name glm-5.2 --trust-remote-code \
-  --tensor-parallel-size 2 --disable-custom-all-reduce \
-  --kv-cache-dtype fp8 --max-model-len 131072 --kv-cache-memory-bytes 8589934592 \
-  --gpu-memory-utilization 0.90 --max-num-batched-tokens 2048 --max-num-seqs 2 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
-  --port 8000
-```
+## Scope — what this fork is not
 
-(31.7 tok/s at `MISS_TOL=8` as shown, 28.3 at strict `0` — both probe‑clean on this stack;
-drop the two `STORE_DIR`/`BASE_RAM_GB` lines for the all‑RAM variant, which then needs
-~200 GiB free host RAM and re‑quantizes on every boot.)
+The upstream lineage carries a large body of Blackwell/SM120 work: 2-bit expert
+codebooks with FP4 recovery, hand-written SASS kernels, tiered NVMe expert
+residency, and support for GLM-5.2 and Kimi-K2.7. **None of that is exercised,
+tested, or supported here.** It is inherited, left in place, and out of scope.
+The SM120 cubins never load on Ada. If you want that work, go to the upstream
+repos below.
 
-**DeepSeek‑V4‑Flash on one PRO 6000** (161 tok/s, 512K window):
+This fork supports exactly one thing: **DeepSeek-V4-Flash on sm_89 via the stock
+MXFP4→Marlin path.** MTP / speculative decoding is unverified on this path.
+Prefix caching is off by default as the correctness baseline.
 
-```bash
-docker run --rm --gpus '"device=0"' --network host --ipc host --shm-size 64g \
-  -v /path/to/DeepSeek-V4-Flash:/model:ro \
-  -e VLLM_MOE_W2=1 -e VLLM_MOE_W2_DELTA_GB=1 \
-  vllm-moet-sm120:v024 \
-  --model /model --served-model-name deepseek-v4-flash --trust-remote-code \
-  --kv-cache-dtype fp8 --block-size 256 --max-model-len 24576 \
-  --gpu-memory-utilization 0.95 --max-num-batched-tokens 1024 --max-num-seqs 4 \
-  --tokenizer-mode deepseek_v4 --no-scheduler-reserve-full-isl \
-  --speculative-config '{"method": "deepseek_mtp", "num_speculative_tokens": 2}' \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
-  --port 8000
-```
+## Lineage
 
-`VLLM_MOE_W2=0` = stock FP4 path (needs ≥2 cards for DS4; GLM's stock NVFP4 does not fit this
-box at all). TP: `--tensor-parallel-size 2|4` + `--disable-custom-all-reduce`. Single‑5090
-DS4 (host‑resident base): `-e VLLM_MOE_W2_BASE_CACHE_GB=14 -e VLLM_MOE_W2_DELTA_GB=0` with
-`--max-model-len 8192 --gpu-memory-utilization 0.95 --max-num-seqs 2` (~80 GiB free host
-RAM — **or add the two NVMe‑store lines from the section above and run in ~30 GiB**; MTP
-works). Do not shrink the pool below 14 GiB to "play it safe" — pool size is the dominant
-perf knob (see the KPI note above; 11 GiB costs ~12% decode and doubles the missing pairs
-per step) and 14 GiB needs util 0.95 to leave room for KV.
+Three forks deep, and the credit splits cleanly:
 
-## Quality
-
-The base-only W2 probe and the maximum-quality result are different configurations.
-The base-only probe used 12 short coherence prompts. It did not validate long coding-agent
-prompts. The maximum-quality result used a 34 GiB FP4 delta, a confidence gate, and FP4
-prefill. It matched the native control on the recorded GSM8K and GPQA runs. Ada does not
-have the FP4 delta kernels and runs the base-only path. See [docs/quality.md](docs/quality.md)
-for the results, limits, and required Ada comparison.
-
-## The SM120 toolchain we built
-
-These kernels exist only because we first built the assembler and the ISA data they need.
-Consumer Blackwell (sm_120) has **no public SASS toolchain**. Current CUDA does expose the
-block‑scaled MMA *instruction* itself (PTX `kind::mxf8f6f4` compiles to `QMMA.SF` — DeepGEMM's
-SM120 port uses it), but everything these kernels are actually made of — hand scheduling
-against measured latencies and control words, the PRMT‑LUT decode interleaved into the QMMA
-stream, register‑bank and occupancy shaping (regcount 64 → 4 CTA/SM) — is decided by ptxas
-and unreachable from CUDA/PTX. So the stack underneath this repo is end‑to‑end ours:
-
-- **[`blackwell-isa`](https://github.com/kacper-daftcode/blackwell-isa)** — a machine‑readable
-  **SM120 SASS ISA database**: 1,994 instruction forms, 128‑bit encoding templates + operand/
-  bitfield maps, and per‑opcode scheduling metadata (pipeline/latency/throughput, control‑word
-  classes). Reverse‑engineered and hardware‑validated on RTX 5090 (47,244 instructions decoded
-  across 178 cubins at 100% coverage; 5,014/5,014 roundtrip‑fuzz). It documents what the CUDA
-  toolchain hides — e.g. `QMMA.SF` block‑scaled FP4 MMA and an undocumented `E3M4` type code.
-  Ships a [searchable HTML reference](https://kacper-daftcode.github.io/blackwell-isa/SM120_ISA_REFERENCE.html).
-- **[`cubit`](https://github.com/kacper-daftcode/cubit)** — an **SM120 SASS assembler/disassembler**
-  built on that database. It turns the hand‑written `.sass` sources in `kernels/sass/` into the
-  cubins this server loads, and is the only tool needed to rebuild or audit them.
-
-**ISA ([`blackwell-isa`](https://github.com/kacper-daftcode/blackwell-isa)) → assembler
-([`cubit`](https://github.com/kacper-daftcode/cubit)) → SASS kernels → this vLLM.** None of the
-kernels here can be *written* through stock CUDA on sm_120 — the instructions compile, the
-kernels don't; this toolchain is what makes them possible.
-
-## Kimi-K2.7-Code (1T MoE) on 4× RTX PRO 6000
-
-**[nvidia/Kimi-K2.7-Code-NVFP4](https://huggingface.co/nvidia/Kimi-K2.7-Code-NVFP4)
-(1T params, 384 experts top‑8, H=7168, dense MLA, 256K) serves on 4× RTX PRO 6000 (TP4)**
-— a checkpoint whose 595 GB of weights cannot even load on this box (384 GB total VRAM):
-the 2‑bit planes total **265.8 GiB** (~66 GiB/rank + ~8 GiB BF16 dense/vision), leaving
-room for a 337K‑token fp8 KV pool and the FP4 delta tier in 96 GB/card. The loader path
-is the same modelopt‑NVFP4 requant as GLM‑5.2‑NVFP4 (f64‑exact dequant → sign‑symmetric
-2‑bit), through a new **K=7168** cubin family (`kernels/`, generated + op‑validated like
-the rest).
-
-Measured (TP4, 131072‑token window, greedy, CUDA graphs, no MTP — the checkpoint ships
-no drafter head; 2026‑07‑10): **51 tok/s** single‑stream decode (**222 tok/s** aggregate
-at 8 streams), **2 448 tok/s** 8K‑unique prefill, needle retrieval **PASS at
-8K/32K/80K/128K**, arithmetic 5/5, generated code executes, `kimi_k2` tool‑calling
-round‑trip works. Serve recipe and
-the bring‑up findings (a checkpoint‑specific **zero‑sign balancing** fix the sweep gate
-caught — the INT4→NVFP4 export writes all exact zeros as +0, which would inject 3× the
-bias that degenerates GLM; an SM12x smem fix for dense‑MLA triton decode; a
-`merge_attn_states` stride fix for >64K chunked prefill):
-**[docs/kimi-k27-code.md](docs/kimi-k27-code.md)**.
-
-## Benchmark results
-
-<!-- bench:table:begin (generated by bench/runner/render.py - do not edit) -->
-
-Release **`baseline-2026-07-10`** — one row per supported recipe (`bench/recipes/`), measured by `bench/runner/bench.py`; full report: [`docs/benchmarks/baseline-2026-07-10.md`](docs/benchmarks/baseline-2026-07-10.md). Single-stream decode and prefill are medians; batch is aggregate tok/s at the noted concurrency.
-
-| model | hardware | config | ctx | decode tok/s | batch | prefill 8K | needle | notes |
-|---|---|---|---:|---:|---:|---:|---|---|
-| deepseek-v4-flash | 1x RTX 5090 (32 GB) | host-resident 2-bit base, GPU as expert cache | 8K | **38** | — | — | — | acc 2.83 † |
-| deepseek-v4-flash | 4x RTX 5090 TP4 | consumer-card throughput | 16K | **214.4** | 1 560 @32 | 6 101 | — | acc 2.6 † |
-| deepseek-v4-flash | 1x RTX PRO 6000 | throughput (24K ctx, FP4 delta auto, MTP k=2) | 24K | **161.2** | 933 @32 | 5 340 | — | acc 2.6 † |
-| deepseek-v4-flash | 1x RTX PRO 6000 | 512K window (delta pool traded for KV) | 512K | — | — | — | PASS ≤453K tok | † |
-| deepseek-v4-flash | 2x RTX PRO 6000 TP2 | throughput | 24K | **209.6** | 380 @3 | 5 791 | — | acc 2.6 † |
-| glm-5.2-nvfp4 | 2x RTX PRO 6000 TP2 | host-resident base, 44 GiB/rank expert cache | 32K | **33** | — | — | PASS ≤27K tok | acc 3 † |
-| glm-5.2-nvfp4 | 4x RTX PRO 6000 TP4 | 2-bit base + MTP k=2, 128K window | 128K | **105** | — | 2 500 | PASS ≤276K tok | † |
-| glm-5.2-nvfp4 | 4x RTX PRO 6000 TP4 | + FP4 delta (auto) + confidence gate tau=0.60 | 128K | **84** | — | — | — | † |
-| kimi-k2.7-code-nvfp4 | 2x RTX PRO 6000 TP2 | host-resident base, 52 GiB/rank cache (~39% coverage) | 16K | **14.4** | — | — | PASS ≤8K tok | † |
-| kimi-k2.7-code-nvfp4 | 4x RTX PRO 6000 TP4 | GPU-resident 2-bit + FP4 delta, 256K window | 256K | **51** | 222 @8 | 2 448 | PASS ≤248K tok | † |
-| kimi-k2.7-code-nvfp4 | 4x RTX PRO 6000 TP4 | + Eagle3 drafter (k=3, drafter TP4) | 256K | **57** (±44%) | — | — | — | acc 3.5 † |
-
-† imported from pre-harness measurements (README/docs history) — re-measured on the next release.
-
-<!-- bench:table:end -->
-
-## Quality vs native
-
-<!-- bench:quality:begin (generated by bench/runner/render.py - do not edit) -->
-
-Quality release **`v2026.07.17-quality`** — dataset evals vs the committed **native baselines** (`bench/baselines/`, same tool/checkpoint/hardware, stock serving path). Cells: accuracy (Δpp vs native, completion-token inflation vs native). Full report: [`docs/benchmarks/v2026.07.17-quality.md`](docs/benchmarks/v2026.07.17-quality.md); process: [`bench/README.md`](bench/README.md).
-
-| model | hardware | config | GSM8K | GPQA | GPQA think | needle | notes |
-|---|---|---|---|---|---|---|---|
-| deepseek-v4-flash | 2x RTX PRO 6000 TP2 | MAX QUALITY: native parity incl. GPQA think | **97.5%** (+0.5pp, tok -0.4%) | **74.8%** (+0.5pp, tok -7.0%) | **88.4%** (+1.5pp, tok +6.0%) | PASS ≤121K tok | † |
-
-† imported from the measurement campaign logs — re-measured by the harness on the next quality release.
-
-<!-- bench:quality:end -->
+- **[kacper-daftcode/vLLM-Moet](https://github.com/kacper-daftcode/vLLM-Moet)** —
+  the original: 2-bit experts, FP4 delta, SM120 SASS toolchain. Blackwell only.
+- **[iSevenDays/vLLM-Moet](https://github.com/iSevenDays/vLLM-Moet)** — the Ada
+  port, and the hard engineering here. FlashInfer's
+  `trtllm_batch_decode_sparse_mla_dsv4` resolves its backend from device arch
+  and refuses anything it has no kernel for, which on Ada means a hard failure
+  at decode graph capture. That author wrote an **arch-portable Triton
+  reimplementation of FlashInfer's SM120 sparse-MLA backend** — same call
+  surface, semantics lifted from flashinfer 0.6.14 — plus a native SM89 FP8
+  grouped matmul for the attention output projection. The port stalled at a
+  validation wall, not an engineering one.
+- **this fork** — broke through the validation wall: four correctness fixes, the
+  reasoning-effort ladder, deterministic MoE, and the measurement to prove it.
 
 ## Repository layout
 
-- **`overlay/vllm/`** contains the complete modified vLLM files. Edit these files.
-- **`patches/`** contains the generated per-file patches for official vLLM v0.25.1.
-- **`vllm/`** is the read-only v0.25.1 baseline at commit `752a3a504`.
-- **`Dockerfile.sm89-v0251`** builds the current Ada image.
-- **`docker/serve_sm89_ds4.sh`** starts DeepSeek-V4-Flash on Ada.
-- **`kernels/`** contains the kernel sources, generated files, cubins, and validation tools.
-- **`docs/ada-sm89-port.md`** describes the current Ada path.
-- **`docs/v024-port.md`** records the historical v0.24.0 Blackwell path.
-- **`docs/quality.md`** describes the quality method.
-- **`bench/`** contains benchmark recipes, the runner, and committed results.
-- **`Dockerfile.recipes`** builds the benchmark recipe image.
+- **`overlay/vllm/`** — complete modified vLLM files. **Edit these.**
+- **`patches/`** — generated per-file patches. Never hand-edit; regenerate with
+  `python3 tools/gen_patches.py` and verify with `--verify`.
+- **`vllm/`** — read-only v0.25.1 baseline at `752a3a504` (gitignored).
+- **`serve_l40s_ds4_tp8.sh`** — the TP8 launcher these results were measured with.
+- **`docs/l40s-*.md`** — the runbooks and the investigation record.
+- **`docs/ada-sm89-port.md`** — the inherited Ada port notes.
+- **`kernels/`, `docker/`, `bench/`** — inherited from upstream; SM120-oriented
+  and not exercised by this fork.
