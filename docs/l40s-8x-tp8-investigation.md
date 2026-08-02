@@ -357,6 +357,77 @@ yes/no on "this kernel is racy", with no inference from downstream logits.
 Needs `ENFORCE_EAGER=1`; `SharedExperts` asserts single-call, so filter to the
 attention module.
 
+### LOCALISED (2026-08-02): the sparse-MLA attention is ORDER-SENSITIVE, and the kernel is not racy
+
+**Forward trace.** `VLLM_DSV4_FWD_TRACE` (1223 modules, `ENFORCE_EAGER=1`, no
+cudagraphs, caching off), two byte-identical requests at ctx 2047, split on
+`model.embed_tokens` into 9 passes and compared chunk-for-chunk:
+
+| prefill chunk | tokens | compressed cand. | result |
+|---|---|---|---|
+| 0 | 1024 | 256 | **bit-identical** |
+| 1 | 1024 | 512 | **bit-identical** |
+| 2 | 15 | 515 | 573 modules differ |
+
+Within chunk 2, in execution order:
+
+```
+[36] out same  ColumnParallelLinear   layers.2.attn.wq_b
+[37] out DIFF  RowParallelLinear      layers.2.attn.wo_b   <- input ALREADY differs
+```
+
+Layers 0–1, both compressors, `indexer.indexer_op`, `indexer`, and `wq_b` are
+all bit-identical. The divergence is injected **between `wq_b` and `wo_b`** —
+the sparse-MLA attention core, which is not an `nn.Module` and so carries no
+hook. Layer 2 is the first indexer layer. `MoERunner` also shows
+"input same, output differs", but that is an artifact of fingerprinting only the
+*first* tensor arg; `DeepseekV4MoE` immediately after shows `IN DIFF`, so the
+MoE inherits rather than injects — consistent with the oracle.
+
+**The kernel itself is NOT racy** (`scratchpad/mla_repro.py`,
+`mla_repro2.py`). Standalone, no server, 5 repeats per configuration:
+
+| geometry | candidate counts swept | distinct outputs | poison leak |
+|---|---|---|---|
+| plain SWA cache | 128…1024 incl. 512/513/516 | 1 | 0 |
+| engine geometry: packed fp8 compressed cache + `extra_sparse_indices` + sinks, T=15 | 128…1024 incl. 511/512/513/516 | 1 | 0 |
+
+Checked two ways: R calls on one set of tensors, and R calls with inputs
+reallocated between calls (same values, new memory — which would expose a read
+of memory the kernel does not own, the bug #2 shape). Zero difference either
+way, and a poisoned `out` buffer comes back fully overwritten, so the
+`torch.empty` allocation at line ~547 is not leaking.
+
+**But it IS order-sensitive.** Same index *set*, permuted per row:
+
+| n_extra | 256 | 512 | 516 | 1024 |
+|---|---|---|---|---|
+| max abs Δ under permutation | 1.56e-02 | 1.56e-02 | 1.56e-02 | 7.81e-03 |
+
+~1 bf16 ULP at that magnitude. Candidates are accumulated in index order and
+float addition is not associative — the same defect family as bug #4, in the
+attention instead of Marlin.
+
+**The mechanism this implies.** Below 512 compressed candidates the top-k is a
+no-op: every candidate is selected and the index list comes out in natural
+order, so the order is stable and the run is reproducible. Above 512 a real
+selection runs; if it emits the same set in a varying order, the attention
+rounds differently, and that ~1 ULP at layer 2 compounds through 43 layers
+(0.50% at layer 4 → 3.86% at layer 42) into the 1.6–4.4 nat logprob spread.
+Every other candidate is excluded: kernel race (ruled out above), tie-breaking
+(0 ties at the cut), the MoE (exonerated twice), chunked prefill (boundary does
+not move with `BATCHED_TOKENS`), and masking below the boundary (logits are
+genuinely identical at 512).
+
+**Still unproven, and it is the one remaining link:** that the selector actually
+emits a *varying order* for the same set above the boundary. Everything else is
+measured; this is inferred by elimination. Confirm by dumping the raw
+`topk_indices` for two identical requests and comparing **element-wise, not as a
+set** — the oracle's `exact: true` only ever checked set membership, which is
+exactly why this hid. If confirmed, the fix is to sort the selected indices
+before the attention consumes them (canonical order), the same remedy shape as
+bug #3's `moe_align` canonicalisation.
+
 ### Superseded: the tie-breaking hypothesis and the oracle plan
 `VLLM_DSV4_TOPK_ORACLE` with `_DET=1` recomputes the logits and reports whether
 they are reproducible. That separates the two candidates directly:
