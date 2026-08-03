@@ -1,5 +1,35 @@
 # CLAUDE-TP8.md — DS4-Flash **GA (0731)** on 8x L40S via vLLM-Moet, TP8
 
+## STATE AS OF 2026-08-03 (read this first on a cold start)
+**Nothing is serving.** The box was taken down deliberately at the end of the
+2026-08-03 session. Repo clean at `287e206`, 73/73 patches verify and check.
+
+Next action is to restore the agentic config and start deep-swe:
+```bash
+tmux new-session -d -s ds4 "MAXLEN=262144 NUM_SEQS=4 PREFIX_CACHING=1 \
+  BATCHED_TOKENS=1024 ./serve_l40s_ds4_tp8.sh 2>&1 | tee logs/tp8-agentic.log"
+```
+Expect `GPU KV cache size: 4,418,044 tokens` / `16.85x` at 256k. Prefix caching
+ON is correct and gated — 2.5x, 99.4% hit rate, and it causes none of the
+output variation (both arms are equally nondeterministic; see bug #5).
+
+Settled this session, newest first:
+- **Bug #5 root-caused and partly fixed.** `top_k_per_row_prefill` (upstream
+  compiled op) emits the same candidate set in a nondeterministic order;
+  `VLLM_DSV4_DETERMINISTIC_TOPK=1` sorts it and makes ctx 2048–10240
+  bit-reproducible. **Defaults to 0** — cost unmeasured end-to-end. A second,
+  probabilistic source remains above ~11k. Sections below.
+- **Prefix caching gated and cleared.** Enable it for agentic work.
+- **fp32 MLA dot resolved null**, knob dropped, int8 KV unblocked.
+- **`--enable-prompt-tokens-details`** now always passed, so `cached_tokens` is
+  visible at the API.
+- **`chat_utils.py` system-role tools fix** ported as `c6777df`.
+
+Open and deliberately not done: benchmark the TOPK knob before defaulting it on;
+chase the ~11k source; run `scratchpad/pc_needle.py` (written, never executed —
+it is the test that would catch long-context *corruption* rather than mere
+difference).
+
 Companion to `l40s-4x-runbook.md` (the 4x L40S / preview-weights box).
 Everything in the parent doc still applies unless contradicted here.
 Field-tested 2026-08-01/02 on the 8x box. Launcher: `serve_l40s_ds4_tp8.sh`.
