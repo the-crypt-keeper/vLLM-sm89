@@ -445,7 +445,77 @@ The kernel is cleared as well, now including engine page size:
 | 64 | all | 1 | 0 |
 | **256** (engine `BLOCK_SIZE`) | all | 1 | 0 |
 
-### Where bug #5 actually stands
+### ROOT CAUSE (2026-08-03): `top_k_per_row_prefill` emits a nondeterministic ORDER — upstream, not the port
+
+Every link is measured.
+
+**1. The selector permutes on bitwise-identical input.** Raising
+`VLLM_DSV4_TOPK_ORACLE_PREFILL` from 1 to 16 (all query rows of the final chunk,
+not just the last one) and diffing `sel_idx` element-wise at layer 2:
+
+| row | logits max, run A / B | logits | selection | positions differing |
+|---|---|---|---|---|
+| 3 | 3.520913 / 3.520913 | same | **same set, reordered** | 315 / 512 |
+| 5 | 2.665767 / 2.665767 | same | **same set, reordered** | 384 / 512 |
+| 10 | 2.995578 / 2.995578 | same | **same set, reordered** | 127 / 512 |
+| 12, 13 | – | same | identical | 0 |
+| **totals** | | **all same** | **10 reordered, 2 identical, 0 different-set** | |
+
+Identical logits in, identical candidate *set* out, different *order*. The
+earlier "layer 2 is clean" reading was an artifact of `_PREFILL=1` sampling one
+row out of fifteen — and it happened to land on one of the two stable rows.
+
+**2. The order survives to the kernel.**
+`compute_global_topk_indices_and_lens` (`deepseek_v4/common/ops/cache_utils.py:426`)
+is a positional map — local index at position *p* → global slot at position *p* —
+so the permutation passes straight through into `extra_sparse_indices`.
+
+**3. The gathered KV sequence therefore differs while the set does not.**
+Sparse-MLA IO trace at layer 2, chunk 2:
+
+```
+q=same  idx_main=DIFF  idx_extra=DIFF
+  kv_main_rows   content(set)=same  sequence(ord)=same   1920/1920
+  kv_extra_rows  content(set)=same  sequence(ord)=DIFF   7680/7680
+```
+
+7680 = 15 tokens × 512 candidates. (`idx_*` differing between two requests is
+expected and benign on its own — the block allocator reuses freed blocks in a
+different order. Only the *ordered* gather fingerprint separates benign
+re-addressing from a real change, which is why the first version of that probe,
+built on `torch.unique`, could not see this.)
+
+**4. The attention is order-sensitive** — ~1 bf16 ULP for a permuted but equal
+index set (1.56e-02 at 256/512/516 candidates), measured standalone.
+
+**5. That compounds** — layer 2 → 0.50% by layer 4 → 3.86% by layer 42 → 1.6–4.4
+nats of prompt-logprob spread.
+
+**Why exactly 2048:** below `k_select = 512` compressed candidates the top-k is
+a no-op, every candidate is selected and the list comes out in natural order, so
+order is stable and the run is bit-reproducible. Above it a real selection runs.
+
+**This is upstream vLLM, not the sm89 port.** `top_k_per_row_prefill` is a
+compiled op from the official wheel (`torch.ops._C.top_k_per_row_prefill`,
+`_custom_ops.py:2723`), it appears in none of our 73 patches, and the pristine
+v0.25.1 baseline calls it identically (`sparse_attn_indexer.py:475`; overlay
+:825). The fork's Triton kernel is exonerated — proven deterministic on
+identical inputs at every geometry tested.
+
+Scope caveat: the *selector* nondeterminism is hardware-independent, but whether
+it *manifests* depends on the downstream attention being order-sensitive. Ours
+is, measured. The SM100 trtllm kernel very likely is too — any FP accumulation
+over candidates in list order would be — but that is **not measured here** and
+should not be claimed without it.
+
+**Fix:** sort each row's selected indices into a canonical order after the
+top-k, before anything consumes them — 512 ints per row, negligible next to the
+attention itself. Exactly the remedy shape as bug #3's `moe_align`
+canonicalisation, and for the same reason: the arithmetic is order-sensitive and
+the producer does not guarantee an order. Worth upstreaming, since the
+nondeterministic producer is upstream's.
+
+### Superseded: where bug #5 stood before the root cause
 Established: the injection is in `layers.2.attn`, between `wq_b` and `wo_b`,
 with **identical `q`** (wq_b bit-identical) and **identical selection indices**
 (dumped and diffed), feeding a kernel that is **deterministic on identical

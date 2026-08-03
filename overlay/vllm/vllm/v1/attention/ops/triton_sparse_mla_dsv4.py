@@ -327,6 +327,132 @@ def _sparse_mla_dsv4_kernel(
     )
 
 
+# ---------------------------------------------------------------------------
+# moet/sm89 diagnostic: sparse-MLA INPUT/OUTPUT trace.
+#
+# Off unless VLLM_DSV4_MLA_IO_TRACE names an output prefix. Fingerprints every
+# tensor this kernel reads and the tensor it writes, per call, so two identical
+# requests can be diffed input-by-input.
+#
+# Why this exists: bug #5's forward trace put the injection inside this call
+# with `q` bit-identical and the selected indices bit-identical, and the kernel
+# is provably deterministic on identical inputs standalone. The only input left
+# is the KV CACHE, which is mutated in place and therefore invisible to a
+# module-output fingerprint -- the same blind spot that hid bug #2.
+#
+# The caches are gigabytes, so the fingerprint covers only the rows the indices
+# actually reference: gather by (idx // pbs, idx % pbs), which is exactly the
+# data the kernel gathers, and cheap.
+#
+#   VLLM_DSV4_MLA_IO_TRACE   output prefix; unset/empty = off
+#   VLLM_DSV4_MLA_IO_MAX     stop after this many calls (per rank)
+_IO_TRACE_PATH = os.environ.get("VLLM_DSV4_MLA_IO_TRACE", "")
+_IO_TRACE_MAX = int(os.environ.get("VLLM_DSV4_MLA_IO_MAX", "200"))
+_io_state: dict = {"n": 0, "fh": None}
+
+
+def _io_fp(t):
+    """Cheap, collision-resistant fingerprint. Integer tensors are summed in
+    int64 (exact); floats in float64. sum + abs-sum + absmax together will not
+    collide for real activations."""
+    if t is None:
+        return None
+    if t.dtype in (torch.uint8, torch.int8, torch.int32, torch.int64,
+                   torch.bool):
+        x = t.detach().to(torch.int64)
+        return {"shape": list(t.shape), "sum": int(x.sum()),
+                "abssum": int(x.abs().sum()), "absmax": int(x.abs().max())}
+    x = t.detach().to(torch.float64)
+    return {"shape": list(t.shape), "sum": float(x.sum()),
+            "abssum": float(x.abs().sum()), "absmax": float(x.abs().max()),
+            "nan": int(torch.isnan(x).sum())}
+
+
+def _io_gather_fp(kv, pbs, idx):
+    """Fingerprint the cache rows `idx` references -- what the kernel reads.
+
+    TWO fingerprints, and the distinction is the whole point:
+
+      set_*  : rows gathered via torch.unique, i.e. SORTED. Answers "is the same
+               CONTENT present", and is deliberately order-insensitive.
+      ord_*  : rows gathered in LIST ORDER with a position weight, so a permuted
+               but equal gather changes it.
+
+    The first version of this probe only had the set form, which cannot see the
+    thing under investigation: physical slot ids legitimately differ between two
+    requests (the block allocator reuses freed blocks in a different order), so
+    a differing `idx` is expected and benign *provided the gathered sequence is
+    the same*. Only the ordered form distinguishes benign re-addressing from a
+    real change in what the kernel sums, and in what order.
+    """
+    if kv is None or idx is None:
+        return None
+    flat = idx.reshape(-1)
+    valid = flat[flat >= 0]
+    if valid.numel() == 0:
+        return {"n_rows": 0}
+
+    def gather(sel):
+        pg, of = sel // pbs, sel % pbs
+        return kv[pg, of, 0] if kv.ndim == 4 else kv[pg, of]
+
+    u = torch.unique(valid).to(torch.int64)
+    srows = gather(u)
+    fp = {"n_rows": int(u.numel()), "n_valid": int(valid.numel())}
+    s = _io_fp(srows)
+    fp.update({f"set_{k}": v for k, v in s.items() if k != "shape"})
+
+    # Ordered form, computed in bounded chunks. A 1024-token chunk references
+    # ~500k rows; materialising that gather as int64 is 2.5 GiB and OOMs the
+    # engine (hit 2026-08-02). Reduce each row to an int64 sum first -- that
+    # keeps the peak at CH*width bytes and stays exact.
+    CH = 32768
+    n = int(valid.numel())
+    wsum = 0
+    tot = 0
+    for start in range(0, n, CH):
+        sel = valid[start:start + CH].to(torch.int64)
+        rs = gather(sel).sum(dim=1, dtype=torch.int64)
+        w = torch.arange(start + 1, start + 1 + int(rs.numel()),
+                         device=rs.device, dtype=torch.int64)
+        wsum += int((rs * w).sum())
+        tot += int(rs.sum())
+    fp["ord_wsum"] = wsum
+    fp["ord_sum"] = tot
+    return fp
+
+
+def _io_trace(q, kv_main, pbs_main, idx_main, lens_main,
+              kv_extra, pbs_extra, idx_extra, lens_extra, sinks, out):
+    import json
+    if _io_state["n"] >= _IO_TRACE_MAX:
+        return
+    fh = _io_state["fh"]
+    if fh is None:
+        try:
+            rank = torch.distributed.get_rank()
+        except Exception:
+            rank = os.getpid()
+        fh = open(f"{_IO_TRACE_PATH}.rank{rank}.jsonl", "a", buffering=1)
+        _io_state["fh"] = fh
+        logger.info("DSv4 sparse-MLA IO TRACE active -> %s.rank%s.jsonl "
+                    "(max=%d)", _IO_TRACE_PATH, rank, _IO_TRACE_MAX)
+    rec = {
+        "call": _io_state["n"],
+        "q": _io_fp(q),
+        "idx_main": _io_fp(idx_main),
+        "lens_main": _io_fp(lens_main),
+        "idx_extra": _io_fp(idx_extra),
+        "lens_extra": _io_fp(lens_extra),
+        "sinks": _io_fp(sinks),
+        "kv_main_rows": _io_gather_fp(kv_main, pbs_main, idx_main),
+        "kv_extra_rows": _io_gather_fp(kv_extra, pbs_extra, idx_extra),
+        "out": _io_fp(out),
+    }
+    fh.write(json.dumps(rec) + "\n")
+    _io_state["n"] += 1
+
+
 def _normalize_kv_cache(
     kv_cache: torch.Tensor,
     kv_layout: str,
@@ -632,6 +758,11 @@ def triton_sparse_mla_dsv4(
             num_warps=4,
             num_stages=1,
         )
+    if _IO_TRACE_PATH:
+        _io_trace(query_flat, kv_main, pbs_main, idx_main, lens_main,
+                  kv_extra if has_extra else None, pbs_extra,
+                  idx_extra if has_extra else None,
+                  lens_extra if has_extra else None, sinks, out_flat)
     return out
 
 
