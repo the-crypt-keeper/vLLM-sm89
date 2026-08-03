@@ -94,6 +94,53 @@ _ORACLE_PREFILL = int(os.environ.get("VLLM_DSV4_TOPK_ORACLE_PREFILL", "0"))
 # but equal set shifts the output by ~1 bf16 ULP (measured). This dumps the
 # vector itself so two runs can be diffed ELEMENT-WISE rather than as sets.
 _ORACLE_RAW = os.environ.get("VLLM_DSV4_TOPK_ORACLE_RAW", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# BUG #5 FIX: canonicalise the selected-index order.
+#
+# The top-k selectors return the right SET and do not promise an order.
+# Measured 2026-08-03: `top_k_per_row_prefill` emits the same 512 candidates in
+# a DIFFERENT ORDER across two byte-identical requests (10 of 12 probed rows at
+# layer 2, on bitwise-identical logits). `compute_global_topk_indices_and_lens`
+# maps positionally, so that permutation reaches the sparse-MLA kernel, which
+# accumulates candidates in list order -- and float addition is not
+# associative, so a permuted-but-equal set shifts the output by ~1 bf16 ULP
+# (1.56e-02, measured standalone). Over 43 layers that becomes 3.86% and
+# 1.6-4.4 nats, i.e. greedy decoding is not reproducible above 2048 tokens of
+# context (= k_select 512 x ratio-4). Below 2048 the top-k is a no-op, the list
+# is in natural order, and the run is bit-identical -- which is exactly why the
+# bug hides under short prompts, and why bug #3's 77-token determinism check
+# passed while this survived.
+#
+# Sorting each row ascending makes the order a function of the selected set
+# alone, which IS deterministic. It does not make the attention
+# order-invariant; it removes the varying input.
+#
+#   VLLM_DSV4_DETERMINISTIC_TOPK=0  stock behaviour (default)
+#                                1  ascending -- the fix
+#                                2  descending -- order-invariance control, the
+#                                   same A/B role =2 plays for the MoE knob
+#
+# Padding is -1 and the consumers expect it to stay at the END of the row, so
+# ascending sorts against a max sentinel rather than sorting -1 to the front.
+_DETERMINISTIC_TOPK = os.environ.get("VLLM_DSV4_DETERMINISTIC_TOPK", "0")
+
+
+def _canonicalise_topk(topk_indices: torch.Tensor) -> None:
+    """Sort each row's selected indices in place, padding (-1) kept last."""
+    if _DETERMINISTIC_TOPK not in ("1", "2") or topk_indices.numel() == 0:
+        return
+    if _DETERMINISTIC_TOPK == "2":
+        # -1 is already the minimum, so a descending sort leaves padding last.
+        vals, _ = torch.sort(topk_indices, dim=-1, descending=True)
+    else:
+        sentinel = torch.iinfo(topk_indices.dtype).max
+        tmp = torch.where(topk_indices >= 0, topk_indices,
+                          torch.full_like(topk_indices, sentinel))
+        vals, _ = torch.sort(tmp, dim=-1)
+        vals = torch.where(vals == sentinel,
+                           torch.full_like(vals, -1), vals)
+    topk_indices.copy_(vals)
 _oracle_state: dict = {"rows": 0, "step": 0, "fh": None}
 
 
@@ -832,6 +879,10 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
+                # bug #5: the selector's row order is not reproducible.
+                # Canonicalise BEFORE the oracle records it, so the probe sees
+                # what the attention will actually consume.
+                _canonicalise_topk(topk_indices)
                 if _ORACLE_PREFILL and _oracle_active(k_cache_prefix):
                     _oracle_record_prefill(
                         k_cache_prefix,
@@ -1074,6 +1125,12 @@ def sparse_attn_indexer(
                 logits.stride(1),
                 k_select,
             )
+
+        # bug #5, decode side: all four selectors above (cooperative_topk,
+        # persistent_topk, top_k_per_row_decode) fill the same buffer and none
+        # of them promises an order, so canonicalise here where they converge.
+        # Before the oracle, for the same reason as the prefill call.
+        _canonicalise_topk(topk_indices)
 
         if _oracle_active(k_cache_prefix):
             # Score whatever just ran against exact top-k, and -- when every

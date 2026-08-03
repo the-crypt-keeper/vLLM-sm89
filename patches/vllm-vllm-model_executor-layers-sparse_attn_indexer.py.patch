@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index ceb52e5..973c9c6 100644
+index ceb52e5..21285cf 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -1,6 +1,8 @@
@@ -24,7 +24,7 @@ index ceb52e5..973c9c6 100644
  from vllm.v1.worker.workspace import current_workspace_manager
  
  logger = init_logger(__name__)
-@@ -42,6 +50,313 @@
+@@ -42,6 +50,360 @@
  
  # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
  MXFP4_BLOCK_SIZE = 32
@@ -72,6 +72,53 @@ index ceb52e5..973c9c6 100644
 +# but equal set shifts the output by ~1 bf16 ULP (measured). This dumps the
 +# vector itself so two runs can be diffed ELEMENT-WISE rather than as sets.
 +_ORACLE_RAW = os.environ.get("VLLM_DSV4_TOPK_ORACLE_RAW", "0") == "1"
++
++# ---------------------------------------------------------------------------
++# BUG #5 FIX: canonicalise the selected-index order.
++#
++# The top-k selectors return the right SET and do not promise an order.
++# Measured 2026-08-03: `top_k_per_row_prefill` emits the same 512 candidates in
++# a DIFFERENT ORDER across two byte-identical requests (10 of 12 probed rows at
++# layer 2, on bitwise-identical logits). `compute_global_topk_indices_and_lens`
++# maps positionally, so that permutation reaches the sparse-MLA kernel, which
++# accumulates candidates in list order -- and float addition is not
++# associative, so a permuted-but-equal set shifts the output by ~1 bf16 ULP
++# (1.56e-02, measured standalone). Over 43 layers that becomes 3.86% and
++# 1.6-4.4 nats, i.e. greedy decoding is not reproducible above 2048 tokens of
++# context (= k_select 512 x ratio-4). Below 2048 the top-k is a no-op, the list
++# is in natural order, and the run is bit-identical -- which is exactly why the
++# bug hides under short prompts, and why bug #3's 77-token determinism check
++# passed while this survived.
++#
++# Sorting each row ascending makes the order a function of the selected set
++# alone, which IS deterministic. It does not make the attention
++# order-invariant; it removes the varying input.
++#
++#   VLLM_DSV4_DETERMINISTIC_TOPK=0  stock behaviour (default)
++#                                1  ascending -- the fix
++#                                2  descending -- order-invariance control, the
++#                                   same A/B role =2 plays for the MoE knob
++#
++# Padding is -1 and the consumers expect it to stay at the END of the row, so
++# ascending sorts against a max sentinel rather than sorting -1 to the front.
++_DETERMINISTIC_TOPK = os.environ.get("VLLM_DSV4_DETERMINISTIC_TOPK", "0")
++
++
++def _canonicalise_topk(topk_indices: torch.Tensor) -> None:
++    """Sort each row's selected indices in place, padding (-1) kept last."""
++    if _DETERMINISTIC_TOPK not in ("1", "2") or topk_indices.numel() == 0:
++        return
++    if _DETERMINISTIC_TOPK == "2":
++        # -1 is already the minimum, so a descending sort leaves padding last.
++        vals, _ = torch.sort(topk_indices, dim=-1, descending=True)
++    else:
++        sentinel = torch.iinfo(topk_indices.dtype).max
++        tmp = torch.where(topk_indices >= 0, topk_indices,
++                          torch.full_like(topk_indices, sentinel))
++        vals, _ = torch.sort(tmp, dim=-1)
++        vals = torch.where(vals == sentinel,
++                           torch.full_like(vals, -1), vals)
++    topk_indices.copy_(vals)
 +_oracle_state: dict = {"rows": 0, "step": 0, "fh": None}
 +
 +
@@ -338,7 +385,7 @@ index ceb52e5..973c9c6 100644
  
  
  def _assert_cutedsl_dcp_merge_supported(
-@@ -291,6 +606,36 @@
+@@ -291,6 +653,36 @@
      return kv_cache.unsqueeze(-2)
  
  
@@ -375,7 +422,7 @@ index ceb52e5..973c9c6 100644
  @eager_break_during_capture
  def sparse_attn_indexer(
      hidden_states: torch.Tensor,
-@@ -313,6 +658,8 @@
+@@ -313,6 +705,8 @@
      dcp_world_size: int = 1,
      cp_kv_cache_interleave_size: int = 1,
      skip_topk_buffer_clear: bool = False,
@@ -384,7 +431,7 @@ index ceb52e5..973c9c6 100644
  ) -> torch.Tensor:
      # careful! this will be None in dummy run
      attn_metadata = get_forward_context().attn_metadata
-@@ -355,6 +702,9 @@
+@@ -355,6 +749,9 @@
              topk_indices_buffer,
              skip_k_cache_insert,
              use_fp4_cache,
@@ -394,10 +441,14 @@ index ceb52e5..973c9c6 100644
          )
      attn_metadata_narrowed = attn_metadata[k_cache_prefix]
      assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
-@@ -482,6 +832,15 @@
+@@ -482,6 +879,19 @@
                      logits.stride(1),
                      topk_tokens,
                  )
++                # bug #5: the selector's row order is not reproducible.
++                # Canonicalise BEFORE the oracle records it, so the probe sees
++                # what the attention will actually consume.
++                _canonicalise_topk(topk_indices)
 +                if _ORACLE_PREFILL and _oracle_active(k_cache_prefix):
 +                    _oracle_record_prefill(
 +                        k_cache_prefix,
@@ -410,7 +461,7 @@ index ceb52e5..973c9c6 100644
  
              _merge_dcp_topk_global(
                  logits,
-@@ -492,6 +851,17 @@
+@@ -492,6 +902,17 @@
                  cp_kv_cache_interleave_size,
                  row_starts=chunk.cu_seqlen_ks,
              )
@@ -428,7 +479,7 @@ index ceb52e5..973c9c6 100644
  
      if has_decode:
          decode_metadata = attn_metadata_narrowed.decode
-@@ -570,21 +940,103 @@
+@@ -570,21 +991,103 @@
                  clean_logits=False,
              )
          num_rows = logits.shape[0]
@@ -535,7 +586,7 @@ index ceb52e5..973c9c6 100644
          if use_cooperative_topk:
              workspace_manager = current_workspace_manager()
              (topk_workspace,) = workspace_manager.get_simultaneous(
-@@ -595,7 +1047,7 @@
+@@ -595,7 +1098,7 @@
                  seq_lens,
                  topk_indices,
                  topk_workspace,
@@ -544,7 +595,7 @@ index ceb52e5..973c9c6 100644
                  attn_metadata_narrowed.max_seq_len,
              )
          elif use_persistent_topk:
-@@ -608,8 +1060,8 @@
+@@ -608,8 +1111,8 @@
                  seq_lens,
                  topk_indices,
                  topk_workspace,
@@ -555,13 +606,19 @@ index ceb52e5..973c9c6 100644
              )
          else:
              ops.top_k_per_row_decode(
-@@ -620,7 +1072,74 @@
+@@ -620,7 +1123,80 @@
                  num_rows,
                  logits.stride(0),
                  logits.stride(1),
 -                topk_tokens,
 +                k_select,
 +            )
++
++        # bug #5, decode side: all four selectors above (cooperative_topk,
++        # persistent_topk, top_k_per_row_decode) fill the same buffer and none
++        # of them promises an order, so canonicalise here where they converge.
++        # Before the oracle, for the same reason as the prefill call.
++        _canonicalise_topk(topk_indices)
 +
 +        if _oracle_active(k_cache_prefix):
 +            # Score whatever just ran against exact top-k, and -- when every
@@ -631,7 +688,7 @@ index ceb52e5..973c9c6 100644
              )
  
          if decode_metadata.global_seq_lens is not None:
-@@ -668,6 +1187,8 @@
+@@ -668,6 +1244,8 @@
      dcp_world_size: int = 1,
      cp_kv_cache_interleave_size: int = 1,
      skip_topk_buffer_clear: bool = False,
@@ -640,7 +697,7 @@ index ceb52e5..973c9c6 100644
  ) -> torch.Tensor:
      return topk_indices_buffer
  
-@@ -731,6 +1252,46 @@
+@@ -731,6 +1309,46 @@
                  "the current vLLM environment."
              )
  
@@ -687,7 +744,7 @@ index ceb52e5..973c9c6 100644
      def forward_native(
          self,
          hidden_states: torch.Tensor,
-@@ -781,6 +1342,7 @@
+@@ -781,6 +1399,7 @@
              self.dcp_rank,
              self.dcp_world_size,
              self.cp_kv_cache_interleave_size,
@@ -695,7 +752,7 @@ index ceb52e5..973c9c6 100644
          )
  
      def forward_xpu(
-@@ -800,6 +1362,9 @@
+@@ -800,6 +1419,9 @@
          weights: torch.Tensor,
      ):
          assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"

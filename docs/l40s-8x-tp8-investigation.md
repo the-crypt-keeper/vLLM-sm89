@@ -515,6 +515,64 @@ canonicalisation, and for the same reason: the arithmetic is order-sensitive and
 the producer does not guarantee an order. Worth upstreaming, since the
 nondeterministic producer is upstream's.
 
+### FIX APPLIED AND VERIFIED (2026-08-03): `VLLM_DSV4_DETERMINISTIC_TOPK`
+
+`_canonicalise_topk()` in `sparse_attn_indexer.py` sorts each row's selected
+indices after the selector runs, before anything consumes them. Called at both
+call sites: after `top_k_per_row_prefill`, and where the three decode selectors
+(`cooperative_topk` / `persistent_topk` / `top_k_per_row_decode`) converge.
+Padding is `-1` and consumers expect it last, so ascending sorts against a max
+sentinel rather than sorting `-1` to the front. `=2` is a descending control,
+mirroring the MoE knob.
+
+**Verified with cudagraphs on, realistic config** (not the eager diagnostic
+build), 6 repeats per length, `max_tokens=1`:
+
+| ctx | before | with `=1` |
+|---|---|---|
+| 2047 | 6 distinct / 6 | **bit-identical** |
+| 2063 | 6 distinct | **bit-identical** |
+| 2200 | 6 distinct | **bit-identical** |
+| 3072 | 6 distinct | **bit-identical** |
+| 4096 | 6 distinct | **bit-identical** |
+| 8192 | 6 distinct | **bit-identical** |
+| 10240 | – | **bit-identical** |
+| 12288 | – | 4 distinct, 0.783 nats |
+| 16384 | 6 distinct | 6 distinct, 1.722 nats |
+| 24000 | 6 distinct | 6 distinct, 2.442 nats |
+
+The reproducible range goes from "nothing above 2048" to **2048–10240**, a 5x
+extension, verified end-to-end.
+
+**Cost: not yet measured end-to-end, and the knob defaults to 0 because of it.**
+The sort is launch-latency bound — 0.132 ms/call at [1024,512], 0.132 at
+[15,512], 0.132 at [4096,512], i.e. identical regardless of row count, so it is
+three kernel launches plus a copy rather than real work. ×43 layers that is
+~5.7 ms per forward, which would be brutal against a ~20 ms decode TPOT if it
+survived cudagraph capture and near-free if it does not. **Benchmark before
+defaulting it on**; fusing the where/sort/where into one kernel is the obvious
+mitigation if the measurement says it matters.
+
+### A SECOND SOURCE REMAINS above ~11k, different in character
+Boundary between 10240 (clean) and 12288 (4 distinct of 6). Unlike the 2048
+boundary this is **probabilistic, not a step** — 4/6, then 3/6 at 14336, then
+6/6 at 15360 — which points at an intermittent race rather than a deterministic
+order flip, i.e. a different mechanism rather than a remnant of this one.
+
+Leading suspect, unverified: `compress_ratios` alternates **4 and 128**
+(`config.json`), and the two ratios take different code paths. Ratio-4 goes
+through `topk_indices_buffer`, which is what the fix canonicalises. Ratio-128
+goes through `attn_metadata.c128a_prefill_topk_indices`, built separately in
+`build_c128a_topk_metadata` (`deepseek_v4/sparse_mla.py:290`) and never touched
+by the fix. Note `max_compressed_tokens` defaults to 8192 there, which is the
+right magnitude but the wrong arithmetic — a ratio-128 layer has only L/128 = 96
+compressed tokens at 12288 — so do not assume that constant is the trigger
+without measuring.
+
+Same instruments apply: `det_probe.py` to bisect, then `TOPK_ORACLE_RAW=1` with
+`_PREFILL` set to the full chunk width (**not 1** — sampling a single query row
+is what made layer 2 look clean and cost a whole hypothesis).
+
 ### Superseded: where bug #5 stood before the root cause
 Established: the injection is in `layers.2.attn`, between `wq_b` and `wo_b`,
 with **identical `q`** (wq_b bit-identical) and **identical selection indices**

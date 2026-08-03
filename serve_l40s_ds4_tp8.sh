@@ -134,6 +134,26 @@ export VLLM_ENGINE_READY_TIMEOUT_S=${VLLM_ENGINE_READY_TIMEOUT_S:-1800}
 # Still overridable: =2 (reversed order) is the order-invariance regression
 # gate, =0 restores stock nondeterministic behaviour for A/B.
 export VLLM_DSV4_DETERMINISTIC_MOE=${VLLM_DSV4_DETERMINISTIC_MOE:-1}
+# Bug #5: the top-k selectors return the right SET and promise no ORDER.
+# top_k_per_row_prefill was measured emitting the same 512 candidates in a
+# different order across two byte-identical requests, and the sparse-MLA
+# attention accumulates in list order, so that permutation is worth ~1 bf16 ULP
+# and compounds to 1.6-4.4 nats over 43 layers. =1 sorts each row ascending,
+# which made ctx 2048..10240 bit-reproducible where none of it was before
+# (verified with cudagraphs on). =2 is the descending control, the same A/B
+# role it plays for the MoE knob above.
+#
+# DEFAULT 0, unlike DETERMINISTIC_MOE, because the cost is not yet measured
+# end-to-end. The sort is launch-latency bound at ~0.13 ms/call eager
+# (identical for 15 and 4096 rows), so ~5.7 ms per forward across 43 layers --
+# which would be severe against a ~20 ms decode TPOT if it survived cudagraph
+# capture, and near-free if it does not. Benchmark before flipping this on.
+#
+# Does NOT fix everything: a second, differently-shaped source remains above
+# ~11k context (probabilistic, 3-6 distinct of 6 repeats, not the clean step
+# that 2048 was). The ratio-128 layers take a separate path
+# (attn_metadata.c128a_prefill_topk_indices) that this does not touch.
+export VLLM_DSV4_DETERMINISTIC_TOPK=${VLLM_DSV4_DETERMINISTIC_TOPK:-0}
 CACHEROOT=${CACHEROOT:-$HOME/.cache/moet-l40s}
 export TRITON_CACHE_DIR=$CACHEROOT/triton
 export TORCHINDUCTOR_CACHE_DIR=$CACHEROOT/torchinductor
