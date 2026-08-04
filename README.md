@@ -48,6 +48,61 @@ at 864 GB/s, and TP8 aggregate bandwidth is what carries the batch.
 Raw `vllm bench serve` JSON and the sweep script are committed under
 [`docs/benchmarks/l40s-tp8-2026-08-02/`](docs/benchmarks/l40s-tp8-2026-08-02/).
 
+### Second sparse-MLA backend, and speculative decoding (2026-08-04)
+
+Two optional levers landed after the numbers above. Both default **off**, so the
+table above is still what you get out of the box.
+
+**`BACKEND=flashinfer`** routes sparse MLA through
+[yhfgyyf/vllm-deepseek-v4-sm89](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89)'s
+FlashInfer build instead of vLLM's Triton port. There is no native sm89 sparse-MLA
+kernel anywhere; what that project did is implement the Ada path *inside*
+FlashInfer's SM120 kernel, substituting an available primitive for every
+SM90+-only one — unscaled FP8 MMA plus a software UE8M0 rescale (exact, since
+block scaling is one scale per k=32 block), `cp.async` for TMA,
+`mbarrier.test_wait.parity` for the SM90 barrier.
+
+**`SPEC=dspark SPEC_TOKENS=3`** enables the DSpark drafter that ships *inside* the
+GA 0731 checkpoint (`mtp.0/1/2`, `markov_head`, `confidence_head`) — no separate
+download. `SPEC_TOKENS=7`, the model card's figure, is far too deep here.
+
+512 in / 2048 out, `--ignore-eos`, output tok/s (mean TPOT in parens):
+
+| conc | Triton, no spec | Triton + DSpark | FlashInfer, no spec | FlashInfer + DSpark |
+|---:|---:|---:|---:|---:|
+| 1 | 52.96 (18.7 ms) | 69.46 (14.2) | 65.59 (15.1) | **118.47 (8.3)** |
+| 4 | 163.62 (24.2) | 190.88 (19.0) | 197.28 (20.0) | **215.45 (17.2)** |
+| 8 | 258.81 (30.5) | 210.24 (34.8) | **295.24 (26.7)** | 252.22 (26.9) |
+
+The two are **synergistic**: at c1 DSpark is worth +31% on the Triton port but
++81% on FlashInfer, beating the product of the independent gains. Each decode
+step carries `k+1 = 4` query tokens, and that multi-query shape is where the
+Triton port is weakest. Best single-stream config is **2.24x** the default.
+
+Speculation crosses over between **c4 and c8 on both backends**, so that boundary
+is a property of the workload, not the kernel. Above it, turn spec off.
+
+> **Graph the spec batch shape or every number is wrong.** With speculation the
+> captured decode shape is `max_num_seqs x (SPEC_TOKENS+1)`, not `max_num_seqs`.
+> A ladder of `1,2,4,8` against `NUM_SEQS=8 SPEC_TOKENS=3` (shape 32) made DSpark
+> measure as a **3.2x loss**; the correct ladder recovered 2.7x of that. vLLM's
+> own default will not save you — it caps at `min(max_num_seqs*2, 512)`, and the
+> `x2` assumes a 1-token draft. `serve_l40s_ds4_tp8.sh` now derives this.
+
+`BACKEND=flashinfer` needs `ninja` and `nvcc` on `PATH` (it JIT-compiles at boot;
+the Triton path never needed a compiler) and a matching FlashInfer wheel:
+
+```bash
+uv pip install --python venv/bin/python \
+  flashinfer_python-0.6.14+sm89.1-py3-none-any.whl   # from that project's releases
+```
+
+Caveats worth stating plainly: that sm89 fallback was **wrong upstream until
+2026-08-02**, so it is young code; it is emulation, so FP8 accumulate range
+differs from true block-scaled hardware; and its own `__CUDA_ARCH__ < 900` gate
+also covers sm80, which we cannot test. The Triton port remains the default and
+the validated path.
+
 ---
 
 ## Validation

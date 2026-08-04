@@ -35,16 +35,53 @@ BLOCK_SIZE=${BLOCK_SIZE:-256}
 UTIL=${UTIL:-0.95}
 BATCHED_TOKENS=${BATCHED_TOKENS:-1024}
 NUM_SEQS=${NUM_SEQS:-32}
-# Capture ladder must REACH NUM_SEQS. It used to be hard-coded to 1..32, so
-# raising NUM_SEQS to 128 left every batch above 32 with no captured graph --
-# a measured 3.7x decode cliff, and silent (the log says "Graph capturing
-# finished" either way). Derive it: powers of two up to NUM_SEQS, plus
-# NUM_SEQS itself when it is not one. Costs ~0.1 GiB per extra size.
+# Capture ladder must REACH the largest decode batch SHAPE. It used to be
+# hard-coded to 1..32, so raising NUM_SEQS to 128 left every batch above 32 with
+# no captured graph -- a measured 3.7x decode cliff, and silent (the log says
+# "Graph capturing finished" either way).
+#
+# WITH SPECULATIVE DECODING THAT SHAPE IS NUM_SEQS*(SPEC_TOKENS+1), NOT NUM_SEQS.
+# Each decode step carries the drafted tokens too, so vLLM's V2 runner computes
+# max_decode_tokens = max_num_reqs * decode_query_len (cudagraph_utils.py). On
+# 2026-08-04 a ladder of 1,2,4,8 against NUM_SEQS=8 SPEC_TOKENS=3 (shape 32) made
+# DSpark measure as a 3.2x LOSS at c8; with 1,2,4,8,16,32 the same config gained
+# 2.7x back. Do NOT rely on vLLM's own default either -- it caps at
+# min(max_num_seqs*2, 512), and that x2 assumes a 1-token draft.
+# Defaults pulled up from the SPEC block below so the ladder can see them; the
+# assignments there are idempotent. Keep the two in sync if you change either.
+SPEC=${SPEC:-none}
+SPEC_TOKENS=${SPEC_TOKENS:-7}
+_CG_TARGET=$NUM_SEQS
+if [ "$SPEC" != "none" ]; then
+  _CG_TARGET=$(( NUM_SEQS * (SPEC_TOKENS + 1) ))
+fi
 if [ -z "${CUDAGRAPH_SIZES:-}" ]; then
   _s=""; _n=1
-  while [ "$_n" -lt "$NUM_SEQS" ]; do _s="${_s}${_s:+,}$_n"; _n=$((_n * 2)); done
-  CUDAGRAPH_SIZES="${_s}${_s:+,}$NUM_SEQS"
+  while [ "$_n" -lt "$_CG_TARGET" ]; do _s="${_s}${_s:+,}$_n"; _n=$((_n * 2)); done
+  CUDAGRAPH_SIZES="${_s}${_s:+,}$_CG_TARGET"
 fi
+
+# BACKEND selects the DSv4 sparse-MLA implementation:
+#   triton     (default) vLLM's Triton port -- ours, the validated baseline
+#   flashinfer yhfgyyf's sm89 FlashInfer build; ~14% faster at c1 and it roughly
+#              doubles what DSpark is worth, but the sm89 fallback is young.
+# The three env vars below are all REQUIRED together; see the route resolver in
+# vllm/utils/flashinfer.py. PATH must carry ninja (venv/bin) and nvcc because
+# this path JIT-compiles at boot -- the Triton path never needed a compiler.
+BACKEND=${BACKEND:-triton}
+case "$BACKEND" in
+  triton) ;;
+  flashinfer)
+    export VLLM_DSV4_SPARSE_MLA_FORCE_FLASHINFER=1
+    export FLASHINFER_SPARSE_MLA_FORCE_SM89_PRIMS=1
+    export FLASHINFER_DISABLE_VERSION_CHECK=1
+    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+    export PATH="$(cd "$(dirname "$0")" && pwd)/venv/bin:$CUDA_HOME/bin:$PATH"
+    command -v ninja >/dev/null || { echo "BACKEND=flashinfer needs ninja on PATH" >&2; exit 1; }
+    command -v nvcc  >/dev/null || { echo "BACKEND=flashinfer needs nvcc on PATH"  >&2; exit 1; }
+    ;;
+  *) echo "BACKEND must be triton|flashinfer (got '$BACKEND')" >&2; exit 1 ;;
+esac
 # FULL_AND_PIECEWISE | PIECEWISE | NONE. DSpark replays FULL graphs and captured
 # only 3 sizes vs the main model's 6 on 2026-08-01; a batch shape outside those
 # faulted in cudagraph_utils.run_fullgraph -> graph.replay(). Drop to PIECEWISE
@@ -95,6 +132,16 @@ esac
 #            on its W2 path. Unverified with Marlin experts.
 SPEC=${SPEC:-none}
 SPEC_TOKENS=${SPEC_TOKENS:-7}
+# SPEC_MODEL points `mtp` at a SEPARATE draft checkpoint. Needed because the
+# 0731 GA weights ship a 3-layer DSpark head (mtp.0/1/2 + confidence_head,
+# 4708 tensors) that vLLM's deepseek_mtp method cannot load -- it wants the
+# clean 1-layer head (1575 tensors) that only the PREVIEW checkpoint has.
+# Build one with ../extract_mtp_head.py, then:
+#   SPEC=mtp SPEC_TOKENS=2 SPEC_MODEL=/media/4TBNVME/models/DeepSeek-V4-Flash-MTP
+# Cross-revision drafting is speed-only risk, not correctness: vLLM's rejection
+# sampling keeps the TARGET distribution regardless of draft quality, so a
+# mismatched head costs acceptance rate, never wrong tokens.
+SPEC_MODEL=${SPEC_MODEL:-}
 # Extra JSON fields spliced into the dspark speculative-config, e.g.
 #   SPEC_EXTRA='"dspark_scheduler":true,"dspark_per_request":true,"dspark_pad_to_bucket":true'
 # pad_to_bucket is what sets real_query_start_loc -> HAS_REAL_LENS=1 in the
@@ -116,7 +163,7 @@ EAGERARGS=""
 case "$SPEC" in
   none)   SPECARGS=() ;;
   dspark) SPECARGS=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_TOKENS,\"draft_sample_method\":\"greedy\"${SPEC_EXTRA:+,$SPEC_EXTRA}}") ;;
-  mtp)    SPECARGS=(--speculative-config "{\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":$SPEC_TOKENS}") ;;
+  mtp)    SPECARGS=(--speculative-config "{\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":$SPEC_TOKENS${SPEC_MODEL:+,\"model\":\"$SPEC_MODEL\"}${SPEC_EXTRA:+,$SPEC_EXTRA}}") ;;
   *) echo "SPEC must be none|dspark|mtp (got '$SPEC')" >&2; exit 1 ;;
 esac
 
@@ -162,6 +209,18 @@ mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$HOME/.cache/torch/kern
 PREFIXARGS=""
 [ "$PREFIX_CACHING" = 1 ] || PREFIXARGS="--no-enable-prefix-caching"
 
+# DEFAULT_CTK sets --default-chat-template-kwargs: template defaults that a
+# request can still override (vLLM merges, request wins). Needed because DS4
+# treats a MISSING reasoning_effort as thinking-OFF -- the template renders
+# `</think>` pre-closed -- and not every client forwards the field. opencode via
+# @ai-sdk/openai-compatible drops it entirely (measured: `"reasoning":0` on every
+# step, ~75 output tokens), so without this an agent comparison silently becomes
+# thinking-vs-no-thinking. mini-swe-agent passes reasoning_effort top-level and
+# is unaffected either way.
+DEFAULT_CTK=${DEFAULT_CTK:-}
+CTKARGS=()
+[ -n "$DEFAULT_CTK" ] && CTKARGS=(--default-chat-template-kwargs "$DEFAULT_CTK")
+
 # --enable-auto-tool-choice requires --tool-call-parser, so they drop together.
 if [ "$PARSERS" = 1 ]; then
   PARSERARGS=(--tool-call-parser deepseek_v4 --enable-auto-tool-choice
@@ -170,7 +229,7 @@ else
   PARSERARGS=()
 fi
 
-echo "serving $MODEL  tp=$TP port=$PORT maxlen=$MAXLEN util=$UTIL batched=$BATCHED_TOKENS seqs=$NUM_SEQS graphs=[$CUDAGRAPH_SIZES] mode=$CUDAGRAPH_MODE prefix-cache=$PREFIX_CACHING spec=$SPEC(${SPEC_TOKENS}) det-moe=$VLLM_DSV4_DETERMINISTIC_MOE mla-dot=$MLA_DOT name=${SERVED_NAMES[0]} W2=off(marlin)"
+echo "serving $MODEL  tp=$TP port=$PORT maxlen=$MAXLEN util=$UTIL batched=$BATCHED_TOKENS seqs=$NUM_SEQS graphs=[$CUDAGRAPH_SIZES] mode=$CUDAGRAPH_MODE prefix-cache=$PREFIX_CACHING spec=$SPEC(${SPEC_TOKENS}) backend=$BACKEND det-moe=$VLLM_DSV4_DETERMINISTIC_MOE mla-dot=$MLA_DOT name=${SERVED_NAMES[0]} W2=off(marlin)"
 
 exec ./venv/bin/vllm serve "$MODEL" \
   --served-model-name "${SERVED_NAMES[@]}" \
@@ -183,6 +242,7 @@ exec ./venv/bin/vllm serve "$MODEL" \
   --no-scheduler-reserve-full-isl \
   --enable-prompt-tokens-details \
   "${PARSERARGS[@]}" \
+  "${CTKARGS[@]}" \
   $PREFIXARGS \
   "${SPECARGS[@]}" \
   ${EAGERARGS} \
