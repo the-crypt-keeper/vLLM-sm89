@@ -105,6 +105,26 @@ server has to cover both interactive and batch traffic, MTP k=1 is the safer
 default. Speculation crosses over between **c4 and c8 on both backends**, so that
 boundary is a property of the workload, not the kernel.
 
+**The backend gain collapses at high concurrency.** Batch-serving config — 16K
+context, `NUM_SEQS=128`, prefix caching off, no speculation, 1K in / 2K out:
+
+| conc | backend | output tok/s | median TPOT | median TTFT |
+|---:|---|---:|---:|---:|
+| 64 | Triton | 1,080.56 | 57.95 ms | **1,512.74 ms** |
+| 64 | FlashInfer | **1,112.41** (+2.9%) | **56.36 ms** | 1,608.63 ms |
+| 128 | Triton | 1,498.53 | 82.47 ms | **3,039.79 ms** |
+| 128 | FlashInfer | **1,533.65** (+2.3%) | **80.72 ms** | 3,136.91 ms |
+
++14% at c1 becomes +2.9% at c64 and +2.3% at c128 — once decode is bandwidth
+bound, FP8 MMA efficiency stops paying. TTFT is consistently *worse* on
+FlashInfer at these batch sizes. For calibration, the Triton figures reproduce
+the 2026-08-02 run above to 1.3% and 0.1%, so run-to-run noise is around 1% and
+the 2-3% gap is real but marginal.
+
+**So: use FlashInfer for interactive/low-concurrency serving, and the Triton port
+for batch evals** — where the gain is inside the noise floor and the Triton path
+is the one with the full correctness record behind it.
+
 > **Graph the spec batch shape or every number is wrong.** With speculation the
 > captured decode shape is `max_num_seqs x (SPEC_TOKENS+1)`, not `max_num_seqs`.
 > A ladder of `1,2,4,8` against `NUM_SEQS=8 SPEC_TOKENS=3` (shape 32) made DSpark
