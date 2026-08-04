@@ -1,8 +1,8 @@
 diff --git a/vllm/utils/flashinfer.py b/vllm/utils/flashinfer.py
-index 998c3b6..00bec0b 100644
+index 998c3b6..fe60851 100644
 --- a/vllm/utils/flashinfer.py
 +++ b/vllm/utils/flashinfer.py
-@@ -153,11 +153,60 @@
+@@ -153,11 +153,120 @@
      "trtllm_batch_decode_with_kv_cache_mla",
      fallback_fn=_missing_sparse_mla,
  )
@@ -12,6 +12,28 @@ index 998c3b6..00bec0b 100644
      "trtllm_batch_decode_sparse_mla_dsv4",
      fallback_fn=_missing_sparse_mla,
  )
++
++
++@functools.lru_cache(maxsize=None)
++def _flashinfer_resolver_backend(device: torch.device) -> str | None:
++    """Ask FlashInfer's OWN arch resolver what it will run on ``device``.
++
++    Returns its backend string (``trtllm-gen`` / ``sparse``) or ``None``
++    when the resolver refuses this silicon or is absent. This is the
++    deepest gate FlashInfer has -- deeper than the import and signature
++    probes, both of which have passed on Ada while the kernel underneath
++    did not exist. Never assume; ask the resolver.
++    """
++    try:
++        from flashinfer.mla._core import _resolve_dsv4_sparse_mla_backend
++    except (ImportError, AttributeError):
++        return None
++    try:
++        backend = _resolve_dsv4_sparse_mla_backend(device)
++    except (ValueError, RuntimeError, TypeError):
++        # ValueError is how stock FlashInfer refuses an unsupported arch.
++        return None
++    return backend or None
 +
 +
 +@functools.lru_cache(maxsize=None)
@@ -28,6 +50,23 @@ index 998c3b6..00bec0b 100644
 +
 +    ``VLLM_DSV4_SPARSE_MLA_FORCE_TRITON=1`` forces the port on any arch
 +    (A/B numerics and perf against the native kernels).
++
++    ``VLLM_DSV4_SPARSE_MLA_FORCE_FLASHINFER=1`` is the mirror image: it
++    routes to FlashInfer on an arch this resolver would otherwise refuse.
++    It exists for the yhfgyyf/vllm-deepseek-v4-sm89 FlashInfer build, which
++    compiles the SM120 sparse-MLA kernel for Ada by swapping every
++    SM90+-only primitive for one sm89 has -- unscaled FP8 MMA plus a
++    software UE8M0 rescale for the block-scaled MMA, cp.async for TMA,
++    ``mbarrier.test_wait.parity`` for the SM90 barrier. Stock FlashInfer
++    0.6.14 has no such path and must NOT be routed here.
++
++    The flag is honoured only when FlashInfer's *own* resolver claims the
++    device (see ``_flashinfer_resolver_backend``). That guard is the whole
++    point: the probes above the resolver have lied before -- Ada passed
++    both the import and the signature check, then died at decode graph
++    capture 41 s into boot. If the flag is set and the resolver refuses,
++    raise at route time rather than silently serving Triton, because a
++    silent fallback would make an A/B benchmark measure the wrong kernel.
 +    """
 +    if os.getenv("VLLM_DSV4_SPARSE_MLA_FORCE_TRITON",
 +                 "0").lower() in ("1", "true", "yes", "on"):
@@ -38,6 +77,27 @@ index 998c3b6..00bec0b 100644
 +    major, minor = torch.cuda.get_device_capability(device)
 +    if major in (10, 12):
 +        return "flashinfer"
++    if os.getenv("VLLM_DSV4_SPARSE_MLA_FORCE_FLASHINFER",
++                 "0").lower() in ("1", "true", "yes", "on"):
++        resolved = _flashinfer_resolver_backend(device)
++        if resolved is not None:
++            logger.warning_once(
++                "DSv4 sparse MLA: VLLM_DSV4_SPARSE_MLA_FORCE_FLASHINFER=1 "
++                "and FlashInfer's own resolver claims sm_%d%d (backend "
++                "'%s') - routing decode AND prefill to FlashInfer instead "
++                "of vLLM's Triton port. This requires an sm89-capable "
++                "FlashInfer build; stock 0.6.14 has no such kernel.",
++                major, minor, resolved)
++            return "flashinfer"
++        raise RuntimeError(
++            f"VLLM_DSV4_SPARSE_MLA_FORCE_FLASHINFER=1 but the installed "
++            f"FlashInfer's own resolver refuses sm_{major}{minor}. Install "
++            f"an sm89-capable build (flashinfer_python==0.6.14+sm89.1 from "
++            f"yhfgyyf/vllm-deepseek-v4-sm89) and set "
++            f"FLASHINFER_SPARSE_MLA_FORCE_SM89_PRIMS=1 so its JIT module is "
++            f"named apart from the prebuilt sm120-only jit-cache entry. "
++            f"Refusing to fall back to the Triton port silently: that would "
++            f"make any A/B measure the kernel you did not select.")
 +    logger.warning_once(
 +        "DSv4 sparse MLA: FlashInfer's resolver has no sm_%d%d kernel "
 +        "(supports SM100/SM103/SM120/SM121) - decode AND prefill route to "
@@ -64,7 +124,7 @@ index 998c3b6..00bec0b 100644
  
  
  # Special case for autotune since it returns a context manager
-@@ -214,7 +263,15 @@
+@@ -214,7 +323,15 @@
  
  @functools.cache
  def has_flashinfer_sparse_mla_sm120() -> bool:
@@ -81,7 +141,7 @@ index 998c3b6..00bec0b 100644
      if not has_flashinfer():
          return False
      try:
-@@ -224,6 +281,16 @@
+@@ -224,6 +341,16 @@
              trtllm_batch_decode_with_kv_cache_mla,
          )
      except ImportError:

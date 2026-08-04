@@ -13,6 +13,8 @@ vllm-vllm-compilation-cuda_graph.py.patch
 vllm-vllm-config-speculative.py.patch
 vllm-vllm-config-vllm.py.patch
 vllm-vllm-entrypoints-chat_utils.py.patch
+vllm-vllm-entrypoints-openai-chat_completion-protocol.py.patch
+vllm-vllm-entrypoints-openai-engine-protocol.py.patch
 vllm-vllm-envs.py.patch
 vllm-vllm-model_executor-layers-attention-mla_attention.py.patch
 vllm-vllm-model_executor-layers-fused_moe-experts-marlin_moe.py.patch
