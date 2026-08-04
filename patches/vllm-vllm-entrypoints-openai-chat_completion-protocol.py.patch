@@ -1,0 +1,20 @@
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index cce5115..d9ad866 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -72,6 +72,15 @@
+         data = handler(self)
+         if len(data.get("tool_calls", [])) == 0:
+             data.pop("tool_calls", None)
++        # Emit the DeepSeek-style `reasoning_content` alias alongside
++        # `reasoning`. The request side already accepts either spelling
++        # (see _normalize_messages_before), but clients that follow
++        # DeepSeek's thinking-mode contract -- which requires the block to
++        # be passed back verbatim on every subsequent tool-carrying request
++        # -- only look for `reasoning_content`, so without this alias they
++        # silently drop the monologue on each agentic turn.
++        if data.get("reasoning") is not None:
++            data["reasoning_content"] = data["reasoning"]
+         return data
+ 
+ 

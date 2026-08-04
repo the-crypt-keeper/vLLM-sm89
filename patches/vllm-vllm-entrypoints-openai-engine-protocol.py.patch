@@ -1,0 +1,16 @@
+diff --git a/vllm/entrypoints/openai/engine/protocol.py b/vllm/entrypoints/openai/engine/protocol.py
+index 2c32fcf..42303ce 100644
+--- a/vllm/entrypoints/openai/engine/protocol.py
++++ b/vllm/entrypoints/openai/engine/protocol.py
+@@ -366,6 +366,11 @@
+         data = handler(self)
+         if len(data.get("tool_calls", [])) == 0:
+             data.pop("tool_calls", None)
++        # Streaming counterpart of the ChatMessage alias; see the comment
++        # there. Kept on the delta so accumulating clients rebuild the same
++        # `reasoning_content` string they would get from a non-streamed call.
++        if data.get("reasoning") is not None:
++            data["reasoning_content"] = data["reasoning"]
+         return data
+ 
+ 
