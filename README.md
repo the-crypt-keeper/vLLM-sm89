@@ -9,7 +9,7 @@ quantization, no 2-bit codebooks, no hand-written SASS. Base is official vLLM
 
 The distinguishing claim is not that it runs. It is that the output has been
 **measured against the DeepSeek cloud API and found statistically
-indistinguishable** — after four correctness bugs that were invisible to every
+indistinguishable** — after five correctness bugs that were invisible to every
 self-test in the stack were found and fixed.
 
 ## Benchmarks
@@ -66,21 +66,44 @@ block scaling is one scale per k=32 block), `cp.async` for TMA,
 GA 0731 checkpoint (`mtp.0/1/2`, `markov_head`, `confidence_head`) — no separate
 download. `SPEC_TOKENS=7`, the model card's figure, is far too deep here.
 
+`MTP` is the third option — the classic 1-layer DeepSeek head, which only the
+**preview** checkpoint ships. Extract it with `extract_mtp_head.py` and point
+`SPEC_MODEL` at it. Cross-revision drafting is a *speed* risk only: rejection
+sampling preserves the target distribution regardless of draft quality.
+
 512 in / 2048 out, `--ignore-eos`, output tok/s (mean TPOT in parens):
 
-| conc | Triton, no spec | Triton + DSpark | FlashInfer, no spec | FlashInfer + DSpark |
-|---:|---:|---:|---:|---:|
-| 1 | 52.96 (18.7 ms) | 69.46 (14.2) | 65.59 (15.1) | **118.47 (8.3)** |
-| 4 | 163.62 (24.2) | 190.88 (19.0) | 197.28 (20.0) | **215.45 (17.2)** |
-| 8 | 258.81 (30.5) | 210.24 (34.8) | **295.24 (26.7)** | 252.22 (26.9) |
+| conc | Triton, no spec | Triton + DSpark k=3 | FlashInfer, no spec | FI + DSpark k=3 | FI + MTP k=1 | FI + MTP k=2 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 52.96 (18.7 ms) | 69.46 (14.2) | 65.59 (15.1) | **118.47 (8.3)** | 99.84 (9.8) | 86.80 (11.3) |
+| 4 | 163.62 (24.2) | 190.88 (19.0) | 197.28 (20.0) | **215.45 (17.2)** | 204.12 (16.8) | 170.49 (22.1) |
+| 8 | 258.81 (30.5) | 210.24 (34.8) | **295.24 (26.7)** | 252.22 (26.9) | 290.37 (24.3) | 221.78 (31.8) |
 
-The two are **synergistic**: at c1 DSpark is worth +31% on the Triton port but
-+81% on FlashInfer, beating the product of the independent gains. Each decode
-step carries `k+1 = 4` query tokens, and that multi-query shape is where the
-Triton port is weakest. Best single-stream config is **2.24x** the default.
+Backend and speculation are **synergistic**: at c1 DSpark is worth +31% on the
+Triton port but +81% on FlashInfer, beating the product of the independent gains.
+Each decode step carries `k+1` query tokens, and that multi-query shape is where
+the Triton port is weakest. Best single-stream config is **2.24x** the default.
 
-Speculation crosses over between **c4 and c8 on both backends**, so that boundary
-is a property of the workload, not the kernel. Above it, turn spec off.
+**Pick your `k` by measuring, not by the model card.** `SPEC_TOKENS` is a
+throughput knob with a sharp optimum, and the card's DSpark figure of 7 is far
+past it here:
+
+| method | k | draft acceptance | mean accept length | verdict |
+|---|---:|---:|---:|---|
+| DSpark | 7 | 12–17% | 1.84–2.19 of 8 | far too deep |
+| DSpark | **3** | 66–73% | 2.78–3.18 of 4 | best peak throughput |
+| MTP | **1** | 25.8% | 1.26 | best at concurrency |
+| MTP | 2 | 15.6% | 1.31 | dominated by k=1 everywhere |
+
+The k=7 "15% acceptance" is a denominator artifact, not a broken drafter —
+accepting ~1.2 of 7 reads as 16% while accepting ~2 of 3 reads as 67%.
+
+**DSpark wins on peak, MTP k=1 wins on flatness.** DSpark k=3 is the fastest
+single-stream option (+81%) but pays 15% at c8; MTP k=1 gives +52% single-stream
+and is within 2% of no-spec at c8, so it degrades far more gracefully. If one
+server has to cover both interactive and batch traffic, MTP k=1 is the safer
+default. Speculation crosses over between **c4 and c8 on both backends**, so that
+boundary is a property of the workload, not the kernel.
 
 > **Graph the spec batch shape or every number is wrong.** With speculation the
 > captured decode shape is `max_num_seqs x (SPEC_TOKENS+1)`, not `max_num_seqs`.
@@ -89,13 +112,8 @@ is a property of the workload, not the kernel. Above it, turn spec off.
 > own default will not save you — it caps at `min(max_num_seqs*2, 512)`, and the
 > `x2` assumes a 1-token draft. `serve_l40s_ds4_tp8.sh` now derives this.
 
-`BACKEND=flashinfer` needs `ninja` and `nvcc` on `PATH` (it JIT-compiles at boot;
-the Triton path never needed a compiler) and a matching FlashInfer wheel:
-
-```bash
-uv pip install --python venv/bin/python \
-  flashinfer_python-0.6.14+sm89.1-py3-none-any.whl   # from that project's releases
-```
+Install steps for both optional paths are under
+[Quickstart](#optional-the-flashinfer-sm89-backend).
 
 Caveats worth stating plainly: that sm89 fallback was **wrong upstream until
 2026-08-02**, so it is young code; it is emulation, so FP8 accumulate range
@@ -156,7 +174,7 @@ Treat long-context behaviour as untested rather than working.
 
 ## What was broken
 
-Four correctness bugs, each found by comparing measured *rates* against a cloud
+Five correctness bugs, each found by comparing measured *rates* against a cloud
 reference and then bisected with instrumentation. None of them threw an error;
 none were caught by the existing self-tests.
 
@@ -210,6 +228,34 @@ silently identical to `low`, `max` delivered high, and the real `max` level was
 unreachable from any request. The official three-level ladder is restored from
 the encoder that ships with the checkpoint, verified byte-identical at
 `low`/`high`/`max`.
+
+**5 — the response said `reasoning`, every client read `reasoning_content`.**
+Not an sm89 bug at all — this one hits anyone self-hosting V4-Flash agentically
+on vLLM 0.25.1. vLLM renamed the response field to `reasoning` (the OpenAI
+spelling), while DeepSeek's API and every client honouring their thinking-mode
+contract read `reasoning_content`. The model's monologue was returned all along
+under a name nothing looked for, so harnesses dropped it on every tool-carrying
+turn and the model re-derived its state from scratch each step.
+
+The request path was never broken — vLLM accepts either spelling inbound and
+renders both back into the assistant turn. Only the two response serializers
+omitted the alias, which is exactly why it was invisible: probing
+`message["reasoning_content"]` and getting `None` is what a *healthy* server
+looks like on this version. Dump the whole message object, not one key.
+
+Measured on deep-swe, 15 tasks, seed 0, mini-swe-agent, identical sampler:
+
+| | before | after | DeepSeek cloud |
+|---|---:|---:|---:|
+| PASS | 2/15 | **7/15** | 7/15 |
+| terminated | 7/15 | 12/15 | 15/15 |
+| "Tool call error" exceptions | 10 | 3 | 0 |
+
+The per-step token profile converges on cloud's — 95,521 → 132,504 input tokens
+per step (cloud 136,561) and 854 → 655 output (cloud 636). The broken arm was
+*lighter* on input because it discarded the monologue, and *heavier* on output
+because the model kept re-deriving what it had already worked out. The remaining
+three failures are wall-clock timeouts, not crashes.
 
 ---
 
@@ -277,8 +323,50 @@ MODEL=/path/to/model NUM_SEQS=128 ./serve_l40s_ds4_tp8.sh
 
 The launcher defaults to `TP=8`; on a four-card box use `TP=4 MAXLEN=32768`.
 Every knob is an env override — `MODEL PORT TP MAXLEN UTIL NUM_SEQS
-BATCHED_TOKENS KV_DTYPE BLOCK_SIZE PREFIX_CACHING SPEC` — and the cudagraph
-capture ladder is derived from `NUM_SEQS`, so it always reaches your batch size.
+BATCHED_TOKENS KV_DTYPE BLOCK_SIZE PREFIX_CACHING BACKEND SPEC SPEC_TOKENS
+SPEC_MODEL` — and the cudagraph capture ladder is derived from `NUM_SEQS` **and
+the speculation depth**, so it always reaches your real decode batch shape.
+
+### Optional: the FlashInfer sm89 backend
+
+Only needed for `BACKEND=flashinfer`. It JIT-compiles at boot, so unlike the
+Triton path it needs a compiler present:
+
+```bash
+# from https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases
+uv pip install --python venv/bin/python flashinfer_python-0.6.14+sm89.1-py3-none-any.whl
+sudo apt install ninja-build      # or: uv pip install --python venv/bin/python ninja
+BACKEND=flashinfer ./serve_l40s_ds4_tp8.sh
+```
+
+Three things that will bite you, all handled by the launcher:
+
+1. `flashinfer-jit-cache` refuses to pair with a differently-versioned
+   `flashinfer-python`, so `FLASHINFER_DISABLE_VERSION_CHECK=1` is required. Keep
+   the jit-cache — every *other* kernel still comes from it.
+2. That jit-cache ships a prebuilt **sm120-only** `sparse_mla_sm120.so` which
+   would shadow the JIT build. `FLASHINFER_SPARSE_MLA_FORCE_SM89_PRIMS=1` renames
+   the module to `sparse_mla_sm120_sm89_prims` and sidesteps it.
+3. `ninja` and `nvcc` must be on `PATH` (`CUDA_HOME` too). The launcher fails
+   fast if either is missing rather than dying mid-boot.
+
+Rollback is `uv pip install --python venv/bin/python flashinfer-python==0.6.14`.
+Note the venv has no `pip` — always go through `uv pip --python venv/bin/python`,
+and keep the wheel's full versioned filename or `uv` rejects it.
+
+### Optional: the MTP draft head
+
+```bash
+python3 extract_mtp_head.py    # needs the PREVIEW checkpoint; symlinks shard 46
+SPEC=mtp SPEC_TOKENS=1 SPEC_MODEL=/path/to/DeepSeek-V4-Flash-MTP ./serve_l40s_ds4_tp8.sh
+```
+
+The 0731 GA checkpoint ships a 3-layer DSpark head (`mtp.0/1/2` +
+`confidence_head`), which vLLM's `deepseek_mtp` method cannot load — it wants the
+clean 1-layer head that only the preview checkpoint has. Both configs claim
+`num_nextn_predict_layers: 1`, so GA's config understates its own head; that
+mismatch is the `KeyError` you will otherwise hit. DSpark needs none of this — its
+weights are already inside the GA checkpoint.
 
 **Patch gotcha:** if site-packages sits inside a git work tree (a venv at the
 repo root does), running `git apply` *from* site-packages silently skips every
@@ -294,7 +382,8 @@ Boot checklist — grep the log for all four:
 
 1. `Using MarlinExperts` (not TRTLLM, not DeepGEMM)
 2. `DeepSeek V4 o_proj: using native SM89 block-scaled FP8 grouped matmul`
-3. `DSv4 sparse-MLA Triton port self-test` passes
+3. `DSv4 sparse-MLA Triton port self-test` passes (or, with `BACKEND=flashinfer`,
+   `routing decode AND prefill to FlashInfer`)
 4. `Available KV cache memory:` is **positive**
 
 Full runbooks: [`docs/l40s-4x-runbook.md`](docs/l40s-4x-runbook.md) (4x box) and
@@ -306,9 +395,22 @@ Full runbooks: [`docs/l40s-4x-runbook.md`](docs/l40s-4x-runbook.md) (4x box) and
 | env | default | what |
 |---|---|---|
 | `VLLM_DSV4_DETERMINISTIC_MOE` | `1` (launcher) | pins the MoE bucketing order. `=2` is the order-invariance regression gate, `=0` is stock nondeterministic behaviour. |
+| `VLLM_DSV4_DETERMINISTIC_TOPK` | `0` | canonicalises the top-k index order (bug #5). Off by default because the throughput cost is unmeasured; without it, first-token argmax can flip run-to-run above ~2048 context. |
 | `VLLM_MOE_W2` | `0` | must stay 0. `=1` reroutes experts to the inherited 2-bit path, which is not what this fork validates. The launcher refuses to start if it leaks in. |
 | `VLLM_DSV4_SPARSE_MLA_SELFTEST` | `1` | keep on. |
+| `VLLM_DSV4_SPARSE_MLA_FORCE_TRITON` | `0` | forces the Triton port on any arch, including ones FlashInfer covers. A/B lever. |
+| `VLLM_DSV4_SPARSE_MLA_FORCE_FLASHINFER` | `0` | the mirror image — routes to FlashInfer on an arch the resolver would otherwise refuse. Honoured **only** if FlashInfer's own resolver claims the device, and raises otherwise; it never silently falls back, because that would make an A/B measure the kernel you did not select. Set by `BACKEND=flashinfer`. |
 | `VLLM_DSV4_MARLIN_ORDER_CHECK` | off | diagnostics, see the investigation doc. |
+
+Launcher-level:
+
+| env | default | what |
+|---|---|---|
+| `BACKEND` | `triton` | `triton` \| `flashinfer`. Selects the sparse-MLA implementation and exports the three env vars the FlashInfer path needs. |
+| `SPEC` | `none` | `none` \| `dspark` \| `mtp`. |
+| `SPEC_TOKENS` | `7` | draft depth. Measure it — see the table above; `3` for DSpark, `1` for MTP. |
+| `SPEC_MODEL` | — | separate draft checkpoint, `mtp` only. |
+| `CUDAGRAPH_SIZES` | derived | powers of two reaching `NUM_SEQS*(SPEC_TOKENS+1)`. Override only if you know why. |
 
 ## Scope — what this fork is not
 
@@ -320,12 +422,13 @@ The SM120 cubins never load on Ada. If you want that work, go to the upstream
 repos below.
 
 This fork supports exactly one thing: **DeepSeek-V4-Flash on sm_89 via the stock
-MXFP4→Marlin path.** MTP / speculative decoding is unverified on this path.
-Prefix caching is off by default as the correctness baseline.
+MXFP4→Marlin path.** Prefix caching is off by default as the correctness
+baseline. Speculative decoding (DSpark, MTP) now works and is measured above, but
+stays off by default.
 
 ## Lineage
 
-Three forks deep, and the credit splits cleanly:
+The credit splits cleanly, and two independent Ada efforts converged:
 
 - **[kacper-daftcode/vLLM-Moet](https://github.com/kacper-daftcode/vLLM-Moet)** —
   the original: 2-bit experts, FP4 delta, SM120 SASS toolchain. Blackwell only.
@@ -338,8 +441,23 @@ Three forks deep, and the credit splits cleanly:
   surface, semantics lifted from flashinfer 0.6.14 — plus a native SM89 FP8
   grouped matmul for the attention output projection. The port stalled at a
   validation wall, not an engineering one.
-- **this fork** — broke through the validation wall: four correctness fixes, the
-  reasoning-effort ladder, deterministic MoE, and the measurement to prove it.
+- **[yhfgyyf/vllm-deepseek-v4-sm89](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89)** —
+  an independent Ada lineage that solved the same kernel gap the other way. There
+  is no native sm89 sparse-MLA kernel anywhere; that author implemented the Ada
+  path *inside* FlashInfer's SM120 kernel, substituting an available primitive
+  for every SM90+-only one — unscaled FP8 MMA plus a software UE8M0 rescale
+  (exact, since block scaling is one scale per k=32 block), `cp.async` for TMA,
+  `mbarrier.test_wait.parity` for the SM90 barrier. Also ports the DSv4 aux ops
+  to CuTe DSL and carries an SM80 build. Optional here via `BACKEND=flashinfer`;
+  we keep our own Triton indexer, since that is the code path we debugged.
+- **[guqiong96/Lvllmds4-x](https://github.com/guqiong96/Lvllmds4-x)** — forks the
+  above and adds `lk_moe`, a CPU-GPU hybrid MoE engine doing NUMA-aware expert
+  compute in system RAM. Aimed at boxes that cannot hold the weights in VRAM;
+  not used here, where all 156 GB is resident at 21 GB/card. Noted for people
+  arriving with less VRAM than this box has.
+- **this fork** — broke through the validation wall: five correctness fixes, the
+  reasoning-effort ladder, the `reasoning_content` response alias, deterministic
+  MoE, the runtime backend switch, and the measurement to prove all of it.
 
 ## Repository layout
 
