@@ -69,12 +69,18 @@ fi
 # vllm/utils/flashinfer.py. PATH must carry ninja (venv/bin) and nvcc because
 # this path JIT-compiles at boot -- the Triton path never needed a compiler.
 BACKEND=${BACKEND:-triton}
+# Unconditional, NOT just on the flashinfer branch. flashinfer-jit-cache refuses
+# to pair with a differently-versioned flashinfer-python, and vLLM imports
+# flashinfer for things unrelated to sparse MLA -- so once the +sm89.1 wheel is
+# installed, BACKEND=triton fails to BOOT without this too (measured 2026-08-04:
+# "flashinfer-jit-cache version (0.6.14+cu130) does not match flashinfer version
+# (0.6.14+sm89.1)" from WorkerProc init). Inert when the versions do match.
+export FLASHINFER_DISABLE_VERSION_CHECK=${FLASHINFER_DISABLE_VERSION_CHECK:-1}
 case "$BACKEND" in
   triton) ;;
   flashinfer)
     export VLLM_DSV4_SPARSE_MLA_FORCE_FLASHINFER=1
     export FLASHINFER_SPARSE_MLA_FORCE_SM89_PRIMS=1
-    export FLASHINFER_DISABLE_VERSION_CHECK=1
     export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
     export PATH="$(cd "$(dirname "$0")" && pwd)/venv/bin:$CUDA_HOME/bin:$PATH"
     command -v ninja >/dev/null || { echo "BACKEND=flashinfer needs ninja on PATH" >&2; exit 1; }
