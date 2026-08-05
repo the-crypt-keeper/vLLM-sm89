@@ -216,13 +216,17 @@ PREFIXARGS=""
 [ "$PREFIX_CACHING" = 1 ] || PREFIXARGS="--no-enable-prefix-caching"
 
 # DEFAULT_CTK sets --default-chat-template-kwargs: template defaults that a
-# request can still override (vLLM merges, request wins). Needed because DS4
-# treats a MISSING reasoning_effort as thinking-OFF -- the template renders
-# `</think>` pre-closed -- and not every client forwards the field. opencode via
-# @ai-sdk/openai-compatible drops it entirely (measured: `"reasoning":0` on every
-# step, ~75 output tokens), so without this an agent comparison silently becomes
-# thinking-vs-no-thinking. mini-swe-agent passes reasoning_effort top-level and
-# is unaffected either way.
+# request can still override (vLLM merges, request wins).
+#
+# OBSOLETE for its original purpose as of the 2026-08-05 upstream tokenizer sync
+# (#50580), and left here only as a general escape hatch. It existed because DS4
+# used to treat a MISSING thinking/enable_thinking as thinking-OFF -- the template
+# rendered `</think>` pre-closed -- and not every client forwards the field.
+# opencode via @ai-sdk/openai-compatible drops it entirely (measured:
+# `"reasoning":0` on every step, ~75 output tokens), so without this an agent
+# comparison silently became thinking-vs-no-thinking. Upstream now defaults that
+# case to thinking ON, so such clients get thinking -- at official *high* effort.
+# mini-swe-agent passes reasoning_effort top-level and was unaffected either way.
 DEFAULT_CTK=${DEFAULT_CTK:-}
 CTKARGS=()
 [ -n "$DEFAULT_CTK" ] && CTKARGS=(--default-chat-template-kwargs "$DEFAULT_CTK")

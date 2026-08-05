@@ -1411,6 +1411,55 @@ The 0.920 → 0.952 eval gain recorded here was `low → official high`. The
 official **max** rung has never been evaluated on this box — it was
 unreachable until now. Worth a run.
 
+### 2026-08-05: superseded upstream — we now ship upstream's ladder verbatim
+vLLM merged the same fix as **#50580** ("DeepSeek V4 0731 reasoning effort
+prompts & mappings"), and **#48780** ("Remove deepseek dead code") deleted the
+unused decode half of `deepseek_v4_encoding.py` (`parse_tool_calls`,
+`decode_dsml_to_arguments`, `tool_calls_to_openai_format`,
+`parse_message_from_completion_text` — verified to have zero callers in our tree
+too; decode lives in the parser engine and the Rust tool parser). Both files were
+re-mirrored from `upstream/main` **byte-identical**, so our custom ladder patch
+is gone and our semantic diff in this area is now **zero** — the two patches are
+a pure upstream backport onto the v0.25.1 wheel. `PreTrainedTokenizerFast` →
+`TokenizersBackend` (from the Transformers 5.10.4 bump, #41359) came along; it is
+a no-op rename — verified `TokenizersBackend is PreTrainedTokenizerFast` on the
+installed transformers 5.14.1.
+
+Measured directly through the tokenizer, `[{"role":"user","content":"Hello!"}]`
+in thinking mode — these are the official 0731 encoder's numbers (6 / 85 / 98):
+
+| request | before (our patch) | after (upstream) |
+|---|---|---|
+| `high` | 85 — official high | 85 — **unchanged** |
+| `max` | 98 — official max | 98 — **unchanged** |
+| `low`, `minimal` | 6 — low | 6 — unchanged |
+| `none` | 6, chat mode | 6, chat mode — unchanged |
+| `medium` | 85 — high | **6 — low** |
+| `xhigh` | 98 — max | **85 — high** |
+| unrecognized | warns → 6 (low) | **silently 85 (high)** |
+| effort omitted, thinking on | 6 — low | **85 — high** |
+| neither `thinking` nor `enable_thinking` passed | chat (thinking **OFF**) | **thinking ON** |
+
+**No existing measurement on this box is affected**: every eval config here sends
+only `high` or `max` (201 and 127 occurrences under `jobs/`), and both rungs are
+byte-identical across the change. The `ds4-max` run directories from 2026-08-01
+are still official *high* for the reason given above, unchanged by this sync.
+
+Two deliberate upstream choices differ from what we had, and we accept them to
+keep the diff at zero: `xhigh` now lands on high rather than max (upstream
+enumerates `max` alone), and unknown values are silently promoted to high instead
+of warning and falling back to low.
+
+**`DEFAULT_CTK` is now obsolete.** It existed because a request carrying neither
+`thinking` nor `enable_thinking` used to render `</think>` pre-closed, silently
+turning an agent comparison into thinking-vs-no-thinking for clients that drop
+the field (opencode via `@ai-sdk/openai-compatible`). Upstream now defaults that
+case to thinking ON, measured above. The serving layer only injects
+`enable_thinking` when `reasoning_effort` is present
+(`entrypoints/openai/chat_completion/protocol.py:536`), so the omitted-field path
+does reach the new default. Note the corollary: such clients now get **official
+high** (85 prompt tokens) by default, not low.
+
 ---
 
 ## BUG #3 (2026-08-02): greedy decoding was nondeterministic — `moe_align_block_size`

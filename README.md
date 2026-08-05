@@ -284,7 +284,9 @@ holding DeepSeek's **high** text, emitted only for `"max"`. So `high` was
 silently identical to `low`, `max` delivered high, and the real `max` level was
 unreachable from any request. The official three-level ladder is restored from
 the encoder that ships with the checkpoint, verified byte-identical at
-`low`/`high`/`max`.
+`low`/`high`/`max`. *Superseded 2026-08-05:* upstream shipped the same fix as
+#50580, so both tokenizer files are now mirrored from `upstream/main`
+byte-identical and our semantic diff here is zero.
 
 **5 — the response said `reasoning`, every client read `reasoning_content`.**
 Not an sm89 bug at all — this one hits anyone self-hosting V4-Flash agentically
