@@ -51,7 +51,10 @@ Raw `vllm bench serve` JSON and the sweep script are committed under
 ### Second sparse-MLA backend, and speculative decoding (2026-08-04)
 
 Two optional levers landed after the numbers above. Both default **off**, so the
-table above is still what you get out of the box.
+table above is still what you get out of the box. The FlashInfer backend is
+**ReasonScape-validated equivalent** to the Triton port over 26,901 prompts
+(below); the speculative paths are measured for throughput but not yet for
+output quality.
 
 **`BACKEND=flashinfer`** routes sparse MLA through
 [yhfgyyf/vllm-deepseek-v4-sm89](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89)'s
@@ -134,6 +137,36 @@ is the one with the full correctness record behind it.
 
 Install steps for both optional paths are under
 [Quickstart](#optional-the-flashinfer-sm89-backend).
+
+#### Both backends are ReasonScape-equivalent
+
+The two sparse-MLA implementations were run head to head over the **full 26,901
+prompt** ReasonScape r12 suite — identical config (16K, `NUM_SEQS=128`, prefix
+caching off, no speculation, `VLLM_DSV4_DETERMINISTIC_MOE=1`), the served model
+name suffixed so the data self-identifies. Per-task score bands:
+
+| statistic | result |
+|---|---|
+| mean delta across 12 tasks | **−0.092 pts** (t = −0.48, df = 11) |
+| range | −1.15 … +1.05 pts |
+| confidence intervals overlapping | **12 / 12** |
+| sign split | 4 better / 8 worse (needs ≥10 of 12 for p<0.05) |
+| completion tokens | +0.45% mean, −2.1 … +2.3% |
+
+**Mean |delta| is 0.550 pts, which is the numeric-noise floor of the r12 regime**
+— useful calibration for reading any future comparison on this suite. Nothing
+here is distinguishable from re-running the same backend twice.
+
+So the emulated FP8 MMA path is functionally equivalent to the Triton port at
+r12 scale. That is a stronger statement than any ULP-level diff could support,
+and it is the level that matters: whatever residual accumulate-order difference
+exists does not reach the output distribution.
+
+Scope, stated precisely: this validates **FlashInfer + no speculation, batch
+serving, r12 prompt lengths**. It does not cover the speculative-decoding paths,
+and r12 prompts are all under 2K so it exercises *decode* past 2K (mean
+completion ~1.7K tokens) but not *prefill* past 2K — that axis belongs to
+agentic evals, where contexts reach 130K.
 
 Caveats worth stating plainly: that sm89 fallback was **wrong upstream until
 2026-08-02**, so it is young code; it is emulation, so FP8 accumulate range
