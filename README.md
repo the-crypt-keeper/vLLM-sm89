@@ -124,9 +124,13 @@ FlashInfer at these batch sizes. For calibration, the Triton figures reproduce
 the 2026-08-02 run above to 1.3% and 0.1%, so run-to-run noise is around 1% and
 the 2-3% gap is real but marginal.
 
-**So: use FlashInfer for interactive/low-concurrency serving, and the Triton port
-for batch evals** — where the gain is inside the noise floor and the Triton path
-is the one with the full correctness record behind it.
+**So: use FlashInfer for interactive/low-concurrency serving, and either for
+batch.** At c64/c128 the 2-3% gain sits close to the ~1% run-to-run noise floor,
+so the choice there is not performance-driven. Output quality is not a
+tiebreaker either — the two are ReasonScape-equivalent over 26,901 prompts
+(below). The remaining asymmetry is coverage, not evidence of a defect: the
+Triton port has the long-context agentic record behind it, and FlashInfer's
+prefill-past-2K behaviour is not yet measured.
 
 > **Graph the spec batch shape or every number is wrong.** With speculation the
 > captured decode shape is `max_num_seqs x (SPEC_TOKENS+1)`, not `max_num_seqs`.
