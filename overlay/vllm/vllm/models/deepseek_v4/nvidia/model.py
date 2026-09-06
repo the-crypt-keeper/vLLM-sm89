@@ -566,9 +566,9 @@ class DeepseekV4MoE(nn.Module):
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
         if is_hash_moe:
-            # hash MoE doesn't use e_score_correction_bias
-            # Use randint instead of empty to avoid garbage values causing
-            # invalid memory access in dummy mode (--load-format="dummy")
+            # hash MoE doesn't use e_score_correction_bias in forward,
+            # but Vision-Exp checkpoints ship gate.bias on all layers —
+            # create the param so the weight loader has somewhere to land it.
             self.gate.tid2eid = nn.Parameter(
                 torch.randint(
                     0,
@@ -578,6 +578,11 @@ class DeepseekV4MoE(nn.Module):
                 ),
                 requires_grad=False,
             )
+            if getattr(config, "topk_method", None) == "noaux_tc":
+                self.gate.e_score_correction_bias = nn.Parameter(
+                    torch.empty(config.n_routed_experts, dtype=torch.float32),
+                    requires_grad=False,
+                )
         elif getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
@@ -1343,6 +1348,7 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
             "head.weight": "lm_head.weight",
             "embed.weight": "embed_tokens.weight",
             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
+            ".ffn.gate.bias_vl": None,
         },
         orig_to_new_substr={
             ".shared_experts.w2": ".shared_experts.down_proj",
