@@ -1334,6 +1334,9 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
             "norm.": "model.norm.",
             "hc_head": "model.hc_head",
             "mtp.": "model.mtp.",
+            "vision.": None,
+            "aligner.": None,
+            "image_": None,
         },
         orig_to_new_regex=scale_regex,
         orig_to_new_suffix={

@@ -1,5 +1,5 @@
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index 5f4a638..66b1b00 100644
+index 5f4a638..eb28eb4 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -70,6 +70,9 @@
@@ -59,3 +59,13 @@ index 5f4a638..66b1b00 100644
          return DeepseekV4FlashInferSM120Attention
      return DeepseekV4FlashMLAAttention
  
+@@ -1303,6 +1334,9 @@
+             "norm.": "model.norm.",
+             "hc_head": "model.hc_head",
+             "mtp.": "model.mtp.",
++            "vision.": None,
++            "aligner.": None,
++            "image_": None,
+         },
+         orig_to_new_regex=scale_regex,
+         orig_to_new_suffix={
