@@ -1,0 +1,29 @@
+diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
+index c656687..072033f 100644
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -217,10 +217,20 @@
+         **kwargs,
+     ) -> None:
+         chat_kwargs = kwargs.pop("chat_template_kwargs", None) or {}
+-        thinking = (
+-            bool(chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking"))
+-            and chat_kwargs.get("reasoning_effort") != "none"
+-        )
++        # Mirror the default in vllm/tokenizers/deepseek_v4.py: when neither
++        # flag is supplied the DS4 template renders thinking mode and prefills
++        # <think>, so the parser must start in REASONING to match it. Leaving
++        # the parser in CONTENT makes the whole monologue arrive as `content`
++        # while the closing </think> is silently swallowed by the
++        # (CONTENT, THINK_END) absorb transition -- reasoning_content ends up
++        # empty and every reasoning token leaks into the answer.
++        if "thinking" not in chat_kwargs and "enable_thinking" not in chat_kwargs:
++            thinking_enabled = True
++        else:
++            thinking_enabled = bool(
++                chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking")
++            )
++        thinking = thinking_enabled and chat_kwargs.get("reasoning_effort") != "none"
+         super().__init__(
+             tokenizer,
+             tools,
